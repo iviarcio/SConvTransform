@@ -76,67 +76,40 @@ void SConv::init() {
 #define GET_OP_CLASSES
 #include "SConv.cpp.inc"
 
-static void updateCallee(mlir::func::CallOp call, llvm::StringRef newTarget) {
-  call.setCallee(newTarget);
-}
+// Implementation of SConv transform dialect operation.
+DiagnosedSilenceableFailure
+transform::SConvOp::apply(transform::TransformRewriter &rewriter,
+                          TransformResults &transformResults,
+                          TransformState &state) {
 
-// Implementation of our transform dialect operation.
-// This operation returns a tri-state result that can be one of:
-// - success when the transformation succeeded;
-// - definite failure when the transformation failed in such a way that
-//   following transformations are impossible or undesirable, typically it could
-//   have left payload IR in an invalid state; it is expected that a diagnostic
-//   is emitted immediately before returning the definite error;
-// - silenceable failure when the transformation failed but following
-//   transformations are still applicable, typically this means a precondition
-//   for the transformation is not satisfied and the payload IR has not been
-//   modified. The silenceable failure additionally carries a Diagnostic that
-//   can be emitted to the user.
-::mlir::DiagnosedSilenceableFailure mlir::transform::ChangeCallTargetOp::apply(
-    // The rewriter that should be used when modifying IR.
-    ::mlir::transform::TransformRewriter &rewriter,
-    // The list of payload IR entities that will be associated with the
-    // transform IR values defined by this transform operation. In this case, it
-    // can remain empty as there are no results.
-    ::mlir::transform::TransformResults &results,
-    // The transform application state. This object can be used to query the
-    // current associations between transform IR values and payload IR entities.
-    // It can also carry additional user-defined state.
-    ::mlir::transform::TransformState &state) {
+  // Call CSA
+  ArrayRef<int64_t> tileSizes_1 = [1, 64, 1, 32, 16, 0, 0];   // 16 canais , 32 colunas, 64 filtros, 2o, 1 tile de uma linha
+  ArrayRef<int64_t> tileSizes_2 = [0, 8, 0, 16, 0, 0, 0];   // 16 canais , 32 colunas, 64 filtros, 2o, 1 tile de uma linha
 
-  // First, we need to obtain the list of payload operations that are associated
-  // with the operand handle.
-  auto payload = state.getPayloadOps(getCall());
+  ArrayRef<int64_t> interchange_1 = [0, 4, 3, 2, 1]; // 4 = F, 3: OH, 2:OW, 1:C
+  ArrayRef<int64_t> interchange_2 = [1, 0];
 
-  // Then, we iterate over the list of operands and call the actual IR-mutating
-  // function. We also check the preconditions here.
-  for (Operation *payloadOp : payload) {
-    auto call = dyn_cast<::mlir::func::CallOp>(payloadOp);
-    if (!call) {
-      DiagnosedSilenceableFailure diag =
-          emitSilenceableError() << "only applies to func.call payloads";
-      diag.attachNote(payloadOp->getLoc()) << "offending payload";
-      return diag;
-    }
-
-    updateCallee(call, getNewTarget());
-  }
+  // mlir::transform::GeneralizeOp (...)
+  // affine_map<(n, oc, oh, ow) -> (n, oc, oh*ow)>
+  // mlir::transform::TileUsingForOp (...)
+  // mlir::transform::TileUsingForOp (...)
+  // mlir::transform::VectorizeOp (...)
+  // mlir::transform::OneShotBufferizeOp (...)
 
   // If everything went well, return success.
   return DiagnosedSilenceableFailure::success();
 }
 
-void mlir::transform::ChangeCallTargetOp::getEffects(
+void mlir::transform::SConvOp::getEffects(
     ::llvm::SmallVectorImpl<::mlir::MemoryEffects::EffectInstance> &effects) {
-  // Indicate that the `call` handle is only read by this operation because the
-  // associated operation is not erased but rather modified in-place, so the
-  // reference to it remains valid.
-  onlyReadsHandle(getCallMutable(), effects);
 
   // Indicate that the payload is modified by this operation.
   modifiesPayload(effects);
 }
 
+LogicalResult mlir::transform::SConvOp::verify() {
+  return success();
+}
 void registerSConv(::mlir::DialectRegistry &registry) {
   registry.addExtensions<SConv>();
 }

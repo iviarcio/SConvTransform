@@ -18,38 +18,40 @@ include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-// Define the new operation. By convention, prefix its name with the name of the dialect 
-// extension, "sconv.". The full operation name will be further prefixed with "transform.".
-def ChangeCallTargetOp : Op<Transform_Dialect, "sconv.tile",
+// Define the sconv operation. By convention, prefix its name with the name of the 
+// extension, "structured.". The full op name will be further prefixed with "transform.".
+def SConvOp : Op<Transform_Dialect, "structured.sconv",
     // Indicate that the operation implements the required TransformOpInterface and
     // MemoryEffectsOpInterface.
     [DeclareOpInterfaceMethods<TransformOpInterface>,
      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
-  // Provide a brief and a full description. It is recommended that the latter describes 
-  // the effects on the operands and how the operation processes various failure modes.
-  let summary = "Changes the callee of a call operation to the specified one";
-  let description = [{
-    For each `func.call` payload operation associated with the handle, changes its 
-    callee to be the symbol whose name is provided as an attribute to this operation.
 
-    Generates a silenceable failure if the operand is associated with payload operations 
-    that are not `func.call`.
-    Only reads the operand.
+  // Provide a brief and a full description of SConvOp. It is recommended describing 
+  // the effects on the operands and how the operation processes various failure modes.
+  let summary = "Improving Direct Convolution through Tensor Slicing, VB Packing.";
+  let description = [{
+    SConv is a direct-convolution algorithm based on an MLIR/LLVM code-generation
+    toolchain that can be integrated into machine-learning compilers.
+    This algorithm introduces: (a) Convolution Slicing Analysis (CSA) — a convolution-
+    specific 3D cache-blocking analysis pass that focuses on tile reuse over the cache
+    hierarchy; (b) Convolution Slicing Optimization (CSO) — a code-generation pass that
+    uses CSA to generate a tiled direct-convolution macro-kernel; and (c) Vector-Based
+    Packing (VBP) — an architecture-specific optimized input-tensor packing solution
+    based on vector-register shift instructions for convolutions with unitary stride.
   }];
 
-  // The arguments include the handle to the payload operations and the attribute that 
-  // specifies the new callee. The handle must implement TransformHandleTypeInterface.   
-  // We use a string attribute as the symbol may not exist in the transform IR so the 
-  // verification may fail. 
-  let arguments = (ins
-    TransformHandleTypeInterface:$call,
-    StrAttr:$new_target);
+  // The argument include the handle to the payload operation.
+  // The handle must implement TransformHandleTypeInterface.   
+  let arguments = (ins TransformHandleTypeInterface:$target);
 
-  // The results are empty as the transformation does not produce any new payload.
-  let results = (outs);
+  let results = (outs TransformHandleTypeInterface:$tiled_packed_op,
+                      Variadic<TransformHandleTypeInterface>:$loops);
 
-  // Provide nice syntax.
-  let assemblyFormat = "$call `,` $new_target attr-dict `:` type($call)";
+  let assemblyFormat = [{
+    $target
+    attr-dict
+    `:` functional-type(operands, results)
+  }];
 }
 
 #endif // SCONV

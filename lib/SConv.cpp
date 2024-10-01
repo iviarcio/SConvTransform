@@ -82,19 +82,39 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
                           TransformResults &transformResults,
                           TransformState &state) {
 
-  // Call CSA
-  ArrayRef<int64_t> tileSizes_1 = [1, 64, 1, 32, 16, 0, 0];   // 16 canais , 32 colunas, 64 filtros, 2o, 1 tile de uma linha
-  ArrayRef<int64_t> tileSizes_2 = [0, 8, 0, 16, 0, 0, 0];   // 16 canais , 32 colunas, 64 filtros, 2o, 1 tile de uma linha
+  // 1. Rewrite the named operation as a generic.
+  auto genericOp = dyn_cast<GenericOp>(linalgOp.getOperation());
+  if (!genericOp) {
+    FailureOr<GenericOp> generalizeResult =
+        generalizeNamedOp(rewriter, linalgOp);
+    assert(succeeded(generalizeResult) && "unexpected failure generalizing op");
+    genericOp = *generalizeResult;
+  }
 
-  ArrayRef<int64_t> interchange_1 = [0, 4, 3, 2, 1]; // 4 = F, 3: OH, 2:OW, 1:C
-  ArrayRef<int64_t> interchange_2 = [1, 0];
+  // 2. Get the current affine maps, iterator types and output tensor shape
+  SmallVector<Value> inputs = genericOp.getDpsInputs();
+  ValueRange outputs = genericOp.getDpsInits();
+  SmallVector<AffineMap> indexingMaps = genericOp.getIndexingMapsArray();
+  SmallVector<utils::IteratorType> iterators = genericOp.getIteratorTypesArray();
+  SmallVector<Type> resultTypes = genericOp.hasPureTensorSemantics()
+                                      ? TypeRange(ValueRange(outputs))
+                                      : TypeRange{};
 
-  // mlir::transform::GeneralizeOp (...)
-  // affine_map<(n, oc, oh, ow) -> (n, oc, oh*ow)>
-  // mlir::transform::TileUsingForOp (...)
-  // mlir::transform::TileUsingForOp (...)
-  // mlir::transform::VectorizeOp (...)
-  // mlir::transform::OneShotBufferizeOp (...)
+  // 3. Replace the affine maps, iterator types and output tensor shape
+
+  GenericOp newOp = rewriter.create<GenericOp>(
+      genericOp.getLoc(), resultTypes, inputs, outputs, indexingMaps, iterators);
+  rewriter.inlineRegionBefore(genericOp->getRegion(0), newOp.getRegion(),
+                              newOp.getRegion().begin());
+  rewriter.replaceOp(genericOp, newOp->getResults());
+
+  // 4. Insert the Collapse shape and Expanded Shape before and after the newOp
+
+  // 5. Call the CSA Analysis
+  
+  // 6. Call the mlir::transform::TileUsingForOp (...)
+
+  // 7. Call the mlir::transform::TileUsingForOp (...)
 
   // If everything went well, return success.
   return DiagnosedSilenceableFailure::success();

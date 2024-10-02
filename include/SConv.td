@@ -13,18 +13,26 @@
 #ifndef SCONV
 #define SCONV
 
+include "mlir/Dialect/Linalg/IR/LinalgOps.td"
+include "mlir/Dialect/Linalg/IR/LinalgStructuredOps.td"
+include "mlir/Dialect/Transform/IR/TransformAttrs.td"
 include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
-include "mlir/IR/OpBase.td"
+include "mlir/Dialect/Transform/IR/TransformTypes.td"
+include "mlir/Dialect/SCF/IR/DeviceMappingInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/DestinationStyleOpInterface.td"
+include "mlir/IR/OpBase.td"
+include "mlir/IR/RegionKindInterface.td"
 
 // Define the sconv operation. By convention, prefix its name with the name of the 
 // extension, "structured.". The full op name will be further prefixed with "transform.".
 def SConvOp : Op<Transform_Dialect, "structured.sconv",
     // Indicate that the operation implements the required TransformOpInterface and
     // MemoryEffectsOpInterface.
-    [DeclareOpInterfaceMethods<TransformOpInterface>,
-     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+    [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
+     TransformOpInterface, TransformEachOpTrait,
+     ReportTrackingListenerFailuresOpTrait]> {
 
   // Provide a brief and a full description of SConvOp. It is recommended describing 
   // the effects on the operands and how the operation processes various failure modes.
@@ -44,7 +52,15 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
   // The handle must implement TransformHandleTypeInterface.   
   let arguments = (ins TransformHandleTypeInterface:$target);
 
-  let results = (outs TransformHandleTypeInterface:$tiled_packed_op,
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure apply(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::linalg::LinalgOp linalgOp,
+        ::mlir::transform::TransformResults &results,
+        ::mlir::transform::TransformState &state);
+  }];
+
+  let results = (outs TransformHandleTypeInterface:$transformed,
                       Variadic<TransformHandleTypeInterface>:$loops);
 
   let assemblyFormat = [{

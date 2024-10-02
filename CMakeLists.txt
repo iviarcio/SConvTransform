@@ -39,5 +39,6 @@ target_link_libraries(transform-opt
   MLIRIR
   MLIRMlirOptMain
   MLIRSideEffectInterfaces
+  MLIRDestinationStyleOpInterface
   SConvDialect
 )

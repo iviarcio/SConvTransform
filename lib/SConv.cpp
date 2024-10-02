@@ -16,6 +16,12 @@
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Transform/IR/TransformTypes.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Utils/Utils.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Linalg/TransformOps/LinalgMatchOps.h"
+#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -41,12 +47,11 @@ public:
 };
 
 void SConv::init() {
-  // Similarly to dialects, an extension can declare a dependent dialect. This
-  // dialect will be loaded along with the extension and, therefore, along with
-  // the Transform dialect. Only declare as dependent the dialects that contain
-  // the attributes or types used by transform operations. Do NOT declare as
-  // dependent the dialects produced during the transformation.
-  // declareDependentDialect<MyDialect>();
+  // As an transform extension dialect, we must declare all dependent dialects.
+  // These dialects will be loaded along with the extension and, therefore,
+  // along with the Transform dialect. The dependent dialects contain the
+  // attributes or types used by transform operations.
+  declareDependentDialect<::mlir::linalg::LinalgDialect>();
 
   // When transformations are applied, they may produce new operations from
   // previously unloaded dialects. Typically, a pass would need to declare
@@ -57,11 +62,12 @@ void SConv::init() {
   //   - generated dialects, which contain the entities (attributes, operations,
   //     types) that may be produced by applying the transformation even when
   //     not present in the original payload IR.
-  // In the following chapter, we will be add operations that generate function
-  // calls and structured control flow operations, so let's declare the
-  // corresponding dialects as generated.
+  declareGeneratedDialect<::mlir::affine::AffineDialect>();
+  declareGeneratedDialect<::mlir::arith::ArithDialect>();
+  declareGeneratedDialect<::mlir::index::IndexDialect>();
   declareGeneratedDialect<::mlir::scf::SCFDialect>();
-  declareGeneratedDialect<::mlir::func::FuncDialect>();
+  declareGeneratedDialect<::mlir::vector::VectorDialect>();
+  declareGeneratedDialect<::mlir::tensor::TensorDialect>();
 
   // Finally, we register the additional transform operations with the dialect.
   // List all operations generated from ODS. This call will perform additional
@@ -76,11 +82,18 @@ void SConv::init() {
 #define GET_OP_CLASSES
 #include "SConv.cpp.inc"
 
+using namespace mlir;
+using namespace mlir::linalg;
+
 // Implementation of SConv transform dialect operation.
 DiagnosedSilenceableFailure
 transform::SConvOp::apply(transform::TransformRewriter &rewriter,
-                          TransformResults &transformResults,
-                          TransformState &state) {
+                          LinalgOp linalgOp,
+                          transform::TransformResults &results,
+                          transform::TransformState &state) {
+
+  // 0. Startup
+  rewriter.setInsertionPoint(linalgOp);
 
   // 1. Rewrite the named operation as a generic.
   auto genericOp = dyn_cast<GenericOp>(linalgOp.getOperation());
@@ -101,6 +114,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
                                       : TypeRange{};
 
   // 3. Replace the affine maps, iterator types and output tensor shape
+  // TODO
 
   GenericOp newOp = rewriter.create<GenericOp>(
       genericOp.getLoc(), resultTypes, inputs, outputs, indexingMaps, iterators);
@@ -109,6 +123,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   rewriter.replaceOp(genericOp, newOp->getResults());
 
   // 4. Insert the Collapse shape and Expanded Shape before and after the newOp
+  // TODO
 
   // 5. Call the CSA Analysis
   

@@ -11,8 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "SConv.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
+
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Transform/IR/TransformOps.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Transform/IR/TransformTypes.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
@@ -20,11 +22,11 @@
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Linalg/TransformOps/LinalgMatchOps.h"
-#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -34,10 +36,14 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
+using namespace mlir;
+using namespace mlir::linalg;
+
+namespace {
 // Define a new transform dialect extension. This uses the CRTP idiom to
 // identify extensions.
 class SConv
-    : public ::mlir::transform::TransformDialectExtension<SConv> {
+    : public transform::TransformDialectExtension<SConv> {
 public:
   // The TypeID of this extension.
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SConv)
@@ -56,7 +62,7 @@ void SConv::init() {
   // These dialects will be loaded along with the extension and, therefore,
   // along with the Transform dialect. The dependent dialects contain the
   // attributes or types used by transform operations.
-  declareDependentDialect<::mlir::linalg::LinalgDialect>();
+  declareDependentDialect<linalg::LinalgDialect>();
 
   // When transformations are applied, they may produce new operations from
   // previously unloaded dialects. Typically, a pass would need to declare
@@ -67,11 +73,11 @@ void SConv::init() {
   //   - generated dialects, which contain the entities (attributes, operations,
   //     types) that may be produced by applying the transformation even when
   //     not present in the original payload IR.
-  declareGeneratedDialect<::mlir::affine::AffineDialect>();
-  declareGeneratedDialect<::mlir::arith::ArithDialect>();
-  declareGeneratedDialect<::mlir::index::IndexDialect>();
-  declareGeneratedDialect<::mlir::scf::SCFDialect>();
-  declareGeneratedDialect<::mlir::tensor::TensorDialect>();
+  declareGeneratedDialect<affine::AffineDialect>();
+  declareGeneratedDialect<arith::ArithDialect>();
+  declareGeneratedDialect<index::IndexDialect>();
+  declareGeneratedDialect<scf::SCFDialect>();
+  declareGeneratedDialect<tensor::TensorDialect>();
 
   // Finally, we register the additional transform operations with the dialect.
   // List all operations generated from ODS. This call will perform additional
@@ -82,12 +88,10 @@ void SConv::init() {
 #include "SConv.cpp.inc"
       >();
 }
+} // namespace
 
 #define GET_OP_CLASSES
 #include "SConv.cpp.inc"
-
-using namespace mlir;
-using namespace mlir::linalg;
 
 // Implementation of SConv transform dialect operation.
 DiagnosedSilenceableFailure
@@ -139,16 +143,17 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   return DiagnosedSilenceableFailure::success();
 }
 
-void mlir::transform::SConvOp::getEffects(
-    ::llvm::SmallVectorImpl<::mlir::MemoryEffects::EffectInstance> &effects) {
+// void transform::SConvOp::getEffects(
+//     ::llvm::SmallVectorImpl<::MemoryEffects::EffectInstance> &effects) {
+//
+//   // Indicate that the payload is modified by this operation.
+//   modifiesPayload(effects);
+// }
 
-  // Indicate that the payload is modified by this operation.
-  modifiesPayload(effects);
-}
+// LogicalResult transform::SConvOp::verify() {
+//   return success();
+// }
 
-LogicalResult mlir::transform::SConvOp::verify() {
-  return success();
-}
-void registerSConv(::mlir::DialectRegistry &registry) {
+void registerSConv(mlir::DialectRegistry &registry) {
   registry.addExtensions<SConv>();
 }

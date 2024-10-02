@@ -10,13 +10,44 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
+#ifndef SCONV_H
+#define SCONV_H
+
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Transform/IR/TransformAttrs.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
-#include "mlir/Interfaces/DestinationStyleOpInterface.h"
+#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
+#include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/RegionKindInterface.h"
+
+namespace mlir {
+class RewriterBase;
+
+namespace linalg {
+class GenericOp;
+class LinalgOp;
+} // namespace linalg
+
+namespace transform {
+class AnyOpType;
+class AnyValueType;
+class OperationType;
+class TransformHandleTypeInterface;
+// Types needed for builders.
+struct TileSizesSpec {};
+struct NumThreadsSpec {};
+} // namespace transform
+} // namespace mlir
+
+namespace mlir {
+class DialectRegistry;
+} // namespace mlir
 
 #define GET_OP_CLASSES
 #include "SConv.h.inc"
 
 // Registers our Transform dialect extension.
 void registerSConv(::mlir::DialectRegistry &registry);
+
+#endif // SCONV_H

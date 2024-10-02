@@ -22,6 +22,11 @@
 #include "mlir/Dialect/Linalg/TransformOps/LinalgMatchOps.h"
 #include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -66,7 +71,6 @@ void SConv::init() {
   declareGeneratedDialect<::mlir::arith::ArithDialect>();
   declareGeneratedDialect<::mlir::index::IndexDialect>();
   declareGeneratedDialect<::mlir::scf::SCFDialect>();
-  declareGeneratedDialect<::mlir::vector::VectorDialect>();
   declareGeneratedDialect<::mlir::tensor::TensorDialect>();
 
   // Finally, we register the additional transform operations with the dialect.
@@ -88,18 +92,18 @@ using namespace mlir::linalg;
 // Implementation of SConv transform dialect operation.
 DiagnosedSilenceableFailure
 transform::SConvOp::apply(transform::TransformRewriter &rewriter,
-                          LinalgOp linalgOp,
+                          LinalgOp target,
                           transform::TransformResults &results,
                           transform::TransformState &state) {
 
   // 0. Startup
-  rewriter.setInsertionPoint(linalgOp);
+  rewriter.setInsertionPoint(target);
 
   // 1. Rewrite the named operation as a generic.
-  auto genericOp = dyn_cast<GenericOp>(linalgOp.getOperation());
+  auto genericOp = dyn_cast<GenericOp>(target.getOperation());
   if (!genericOp) {
     FailureOr<GenericOp> generalizeResult =
-        generalizeNamedOp(rewriter, linalgOp);
+        generalizeNamedOp(rewriter, target);
     assert(succeeded(generalizeResult) && "unexpected failure generalizing op");
     genericOp = *generalizeResult;
   }

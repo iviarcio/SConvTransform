@@ -21,7 +21,9 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
 #include "mlir/Dialect/Linalg/TransformOps/LinalgMatchOps.h"
+#include "mlir/Dialect/Linalg/TransformOps/Syntax.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -95,10 +97,10 @@ void SConv::init() {
 
 // Implementation of SConv transform dialect operation.
 DiagnosedSilenceableFailure
-transform::SConvOp::apply(transform::TransformRewriter &rewriter,
-                          LinalgOp target,
-                          transform::TransformResults &results,
-                          transform::TransformState &state) {
+transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
+                               LinalgOp target,
+                               transform::ApplyToEachResultList &results,
+                               transform::TransformState &state) {
 
   // 0. Startup
   rewriter.setInsertionPoint(target);
@@ -122,7 +124,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
                                       : TypeRange{};
 
   // 3. Replace the affine maps, iterator types and output tensor shape
-  // TODO
+  // TOD
 
   GenericOp newOp = rewriter.create<GenericOp>(
       genericOp.getLoc(), resultTypes, inputs, outputs, indexingMaps, iterators);
@@ -131,7 +133,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   rewriter.replaceOp(genericOp, newOp->getResults());
 
   // 4. Insert the Collapse shape and Expanded Shape before and after the newOp
-  // TODO
+  // TOD
 
   // 5. Call the CSA Analysis
   

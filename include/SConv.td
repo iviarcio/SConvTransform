@@ -13,6 +13,7 @@
 #ifndef SCONV
 #define SCONV
 
+include "mlir/Dialect/Linalg/TransformOps/LinalgTransformEnums.td"
 include "mlir/Dialect/Transform/IR/TransformAttrs.td"
 include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
@@ -49,22 +50,19 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
   // The handle must implement TransformHandleTypeInterface.   
   let arguments = (ins TransformHandleTypeInterface:$target);
 
-  let results = (outs TransformHandleTypeInterface:$transformed,
-                      Variadic<TransformHandleTypeInterface>:$loops);
+  let results = (outs TransformHandleTypeInterface:$transformed);
 
   let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure apply(
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
         ::mlir::transform::TransformRewriter &rewriter,
         ::mlir::linalg::LinalgOp target,
-        ::mlir::transform::TransformResults &results,
+        ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];
 
-  let assemblyFormat = [{
-    $target
-    attr-dict
-    `:` functional-type(operands, results)
-  }];
+  let assemblyFormat =
+      "$target attr-dict `:` "
+      "custom<SemiFunctionType>(type($target), type($transformed))";
 }
 
 #endif // SCONV

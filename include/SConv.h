@@ -34,9 +34,6 @@ class AnyOpType;
 class AnyValueType;
 class OperationType;
 class TransformHandleTypeInterface;
-// Types needed for builders.
-struct TileSizesSpec {};
-struct NumThreadsSpec {};
 } // namespace transform
 } // namespace mlir
 

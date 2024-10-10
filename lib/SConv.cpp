@@ -124,37 +124,19 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
                                transform::ApplyToEachResultList &results,
                                transform::TransformState &state) {
 
-  // 0. Startup
-  Location loc = namedOp.getLoc();
+  // 1. Get context and namedOp params
   MLIRContext *context = rewriter.getContext();
+  Location loc = namedOp.getLoc();
 
-  rewriter.setInsertionPoint(namedOp); /* Is it necessary? */
+  SmallVector<Value> inputs = namedOp.getDpsInputs();
+  ValueRange outputs = namedOp.getDpsInits();
+  Value input = inputs[0];
+  Value filter = inputs[1];
+  Value output = outputs[0];
 
-  // 1. Rewrite the named operation as a generic.
-  auto genericOp = dyn_cast<GenericOp>(namedOp.getOperation());
-  if (!genericOp) {
-    FailureOr<GenericOp> generalizeResult =
-        generalizeNamedOp(rewriter, namedOp);
-    assert(succeeded(generalizeResult) && "unexpected failure generalizing op");
-    genericOp = *generalizeResult;
-  }
-
-  // 2. Replace the affine maps, iterator types and output tensor shape
-  SmallVector<Value> inputs = genericOp.getDpsInputs();
-  auto inputType = cast<ShapedType>(genericOp.getInputs()[0].getType());
-  auto filterType = cast<ShapedType>(genericOp.getInputs()[1].getType());
-  auto outputType = cast<ShapedType>(genericOp.getOutputs()[0].getType());
-
-  // if (!filterType.hasStaticShape())
-  //   return rewriter.notifyMatchFailure(genericOp,
-  //                                      "expected a static shape for the filter");
-
-  // if (!inputType.hasStaticShape())
-  //   return rewriter.notifyMatchFailure(genericOp,
-  //                                      "expected a static shape for the input");
-
-  Value input = genericOp.getInputs()[0];
-  Value output = genericOp.getOutputs()[0];
+  auto inputType = cast<ShapedType>(input.getType());
+  auto filterType = cast<ShapedType>(filter.getType());
+  auto outputType = cast<ShapedType>(output.getType());
 
   auto outputShape = outputType.getShape();
   int64_t n = outputShape[0];
@@ -162,27 +144,25 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
   int64_t oh = outputShape[2];
   int64_t ow = outputShape[3];
 
-  // 3. Insert the Collapse shape before the newOp
+  // 2. Create the Collapse shape to be inserted at begining
   SmallVector<ReassociationIndices> outputReassocIndices = {{0}, {1}, {2, 3}};
   auto reshapedOutputType = RankedTensorType::get({n, oc, oh * ow}, outputType.getElementType());
-
   Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
       loc, reshapedOutputType, output, outputReassocIndices);
 
+  // 3. Create the affine maps, iterator types and output tensor shape
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
   SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
 
   AffineExpr d0, d1, d3, d4, d5, d6;
   bindDims(context, d0, d1, d3, d4, d5, d6);
-  auto d7 = d3.floorDiv(oh) + d5;
-  auto d8 = d3 % oh + d6;
-  auto lhsMap = AffineMap::get(4, 0, {d0, d4, d7, d8}, context);
-  auto rhsMap = AffineMap::get(4, 0, {d1, d4, d5, d6}, context);
-  auto resultMap = AffineMap::get(3, 0, {d0, d1, d3}, context);
+  auto lhsMap = AffineMap::get(6, 0, {d0, d4, d3.floorDiv(oh) + d5, d3 % oh + d6}, context);
+  auto rhsMap = AffineMap::get(6, 0, {d1, d4, d5, d6}, context);
+  auto resultMap = AffineMap::get(6, 0, {d0, d1, d3}, context);
 
   // 4. Create the new generic Op
-  auto newOp = rewriter.create<linalg::GenericOp>(
+  auto genericOp = rewriter.create<linalg::GenericOp>(
       loc,
       reshapedOutputType,
       inputs,
@@ -190,38 +170,30 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
       ArrayRef<AffineMap>{lhsMap, rhsMap, resultMap},
       newOpIterators,
       [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-        Value mul =
-            createMul(loc, args[0], args[1], args[2].getType(), nestedBuilder);
+        Value mul = createMul(loc, args[0], args[1], args[2].getType(), nestedBuilder);
         Value add = createAdd(loc, mul, args[2], nestedBuilder);
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
-  Value result = newOp.getResults().front();
+  Value result = genericOp.getResults().front();
 
-  // 5. Insert the Expanded Shape after the newOp
+  // 5. Create the Expanded Shape to be inserted after the genericOp
   auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(
       loc, outputType, result, outputReassocIndices);
 
-  rewriter.replaceOp(newOp, ArrayRef<Value>{reshapedResult});
+  // 6. Replace the namedOp to genericOp
+  rewriter.replaceOp(namedOp, ArrayRef<Value>{reshapedResult});
 
   // 6. Call the CSA Analysis
   
   // 7. Call the mlir::transform::TileUsingForOp (...) twice
 
   // If everything went well, return success.
+
+  results.push_back(genericOp);
+
   return DiagnosedSilenceableFailure::success();
 }
-
-// void transform::SConvOp::getEffects(
-//     ::llvm::SmallVectorImpl<::MemoryEffects::EffectInstance> &effects) {
-//
-//   // Indicate that the payload is modified by this operation.
-//   modifiesPayload(effects);
-// }
-
-// LogicalResult transform::SConvOp::verify() {
-//   return success();
-// }
 
 void registerSConv(mlir::DialectRegistry &registry) {
   registry.addExtensions<SConv>();

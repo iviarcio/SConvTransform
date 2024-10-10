@@ -37,9 +37,13 @@
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Debug.h"
 
 using namespace mlir;
 using namespace mlir::linalg;
+
+#define DEBUG_TYPE "sconv-transform"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 
 namespace {
 // Define a new transform dialect extension. This uses the CRTP idiom to
@@ -95,51 +99,114 @@ void SConv::init() {
 #define GET_OP_CLASSES
 #include "SConv.cpp.inc"
 
+static Value createAdd(Location loc, Value x, Value y, OpBuilder &builder) {
+  if (isa<IntegerType>(x.getType()))
+    return builder.create<arith::AddIOp>(loc, x, y);
+  return builder.create<arith::AddFOp>(loc, x, y);
+}
+
+static Value createMul(Location loc, Value x, Value y, Type accType,
+                       OpBuilder &builder) {
+  // Linalg named ops specify signed extend for named ops.
+  Value xConvert =
+      convertScalarToDtype(builder, loc, x, accType, /*isUnsignedCast=*/false);
+  Value yConvert =
+      convertScalarToDtype(builder, loc, y, accType, /*isUnsignedCast=*/false);
+  if (isa<IntegerType>(accType))
+    return builder.create<arith::MulIOp>(loc, xConvert, yConvert);
+  return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
+}
+
 // Implementation of SConv transform dialect operation.
 DiagnosedSilenceableFailure
 transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
-                               LinalgOp target,
+                               LinalgOp namedOp,
                                transform::ApplyToEachResultList &results,
                                transform::TransformState &state) {
 
   // 0. Startup
-  rewriter.setInsertionPoint(target);
+  Location loc = namedOp.getLoc();
+  MLIRContext *context = rewriter.getContext();
+
+  rewriter.setInsertionPoint(namedOp); /* Is it necessary? */
 
   // 1. Rewrite the named operation as a generic.
-  auto genericOp = dyn_cast<GenericOp>(target.getOperation());
+  auto genericOp = dyn_cast<GenericOp>(namedOp.getOperation());
   if (!genericOp) {
     FailureOr<GenericOp> generalizeResult =
-        generalizeNamedOp(rewriter, target);
+        generalizeNamedOp(rewriter, namedOp);
     assert(succeeded(generalizeResult) && "unexpected failure generalizing op");
     genericOp = *generalizeResult;
   }
 
-  // 2. Get the current affine maps, iterator types and output tensor shape
+  // 2. Replace the affine maps, iterator types and output tensor shape
   SmallVector<Value> inputs = genericOp.getDpsInputs();
-  ValueRange outputs = genericOp.getDpsInits();
-  SmallVector<AffineMap> indexingMaps = genericOp.getIndexingMapsArray();
-  SmallVector<utils::IteratorType> iterators = genericOp.getIteratorTypesArray();
-  SmallVector<Type> resultTypes = genericOp.hasPureTensorSemantics()
-                                      ? TypeRange(ValueRange(outputs))
-                                      : TypeRange{};
+  auto inputType = cast<ShapedType>(genericOp.getInputs()[0].getType());
+  auto filterType = cast<ShapedType>(genericOp.getInputs()[1].getType());
+  auto outputType = cast<ShapedType>(genericOp.getOutputs()[0].getType());
 
-  // 3. Replace the affine maps, iterator types and output tensor shape
-  // TOD
+  // if (!filterType.hasStaticShape())
+  //   return rewriter.notifyMatchFailure(genericOp,
+  //                                      "expected a static shape for the filter");
 
-  GenericOp newOp = rewriter.create<GenericOp>(
-      genericOp.getLoc(), resultTypes, inputs, outputs, indexingMaps, iterators);
-  rewriter.inlineRegionBefore(genericOp->getRegion(0), newOp.getRegion(),
-                              newOp.getRegion().begin());
-  rewriter.replaceOp(genericOp, newOp->getResults());
+  // if (!inputType.hasStaticShape())
+  //   return rewriter.notifyMatchFailure(genericOp,
+  //                                      "expected a static shape for the input");
 
-  // 4. Insert the Collapse shape and Expanded Shape before and after the newOp
-  // TOD
+  Value input = genericOp.getInputs()[0];
+  Value output = genericOp.getOutputs()[0];
 
-  // 5. Call the CSA Analysis
+  auto outputShape = outputType.getShape();
+  int64_t n = outputShape[0];
+  int64_t oc = outputShape[1];
+  int64_t oh = outputShape[2];
+  int64_t ow = outputShape[3];
+
+  // 3. Insert the Collapse shape before the newOp
+  SmallVector<ReassociationIndices> outputReassocIndices = {{0}, {1}, {2, 3}};
+  auto reshapedOutputType = RankedTensorType::get({n, oc, oh * ow}, outputType.getElementType());
+
+  Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
+      loc, reshapedOutputType, output, outputReassocIndices);
+
+  auto parallel = utils::IteratorType::parallel;
+  auto reduction = utils::IteratorType::reduction;
+  SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
+
+  AffineExpr d0, d1, d3, d4, d5, d6;
+  bindDims(context, d0, d1, d3, d4, d5, d6);
+  auto d7 = d3.floorDiv(oh) + d5;
+  auto d8 = d3 % oh + d6;
+  auto lhsMap = AffineMap::get(4, 0, {d0, d4, d7, d8}, context);
+  auto rhsMap = AffineMap::get(4, 0, {d1, d4, d5, d6}, context);
+  auto resultMap = AffineMap::get(3, 0, {d0, d1, d3}, context);
+
+  // 4. Create the new generic Op
+  auto newOp = rewriter.create<linalg::GenericOp>(
+      loc,
+      reshapedOutputType,
+      inputs,
+      ValueRange{reshapedOutput},
+      ArrayRef<AffineMap>{lhsMap, rhsMap, resultMap},
+      newOpIterators,
+      [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+        Value mul =
+            createMul(loc, args[0], args[1], args[2].getType(), nestedBuilder);
+        Value add = createAdd(loc, mul, args[2], nestedBuilder);
+        nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
+      });
+
+  Value result = newOp.getResults().front();
+
+  // 5. Insert the Expanded Shape after the newOp
+  auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(
+      loc, outputType, result, outputReassocIndices);
+
+  rewriter.replaceOp(newOp, ArrayRef<Value>{reshapedResult});
+
+  // 6. Call the CSA Analysis
   
-  // 6. Call the mlir::transform::TileUsingForOp (...)
-
-  // 7. Call the mlir::transform::TileUsingForOp (...)
+  // 7. Call the mlir::transform::TileUsingForOp (...) twice
 
   // If everything went well, return success.
   return DiagnosedSilenceableFailure::success();

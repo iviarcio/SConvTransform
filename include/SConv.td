@@ -55,7 +55,7 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
         ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::linalg::LinalgOp target,
+        ::mlir::linalg::LinalgOp namedOp,
         ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];

@@ -99,6 +99,11 @@ void SConv::init() {
 #define GET_OP_CLASSES
 #include "SConv.cpp.inc"
 
+static bool hasAllOneValues(DenseIntElementsAttr attr) {
+  return llvm::all_of(
+      attr, [](const APInt &element) { return element.getSExtValue() == 1; });
+}
+
 static Value createAdd(Location loc, Value x, Value y, OpBuilder &builder) {
   if (isa<IntegerType>(x.getType()))
     return builder.create<arith::AddIOp>(loc, x, y);
@@ -120,11 +125,11 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
 // Implementation of SConv transform dialect operation.
 DiagnosedSilenceableFailure
 transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
-                               LinalgOp namedOp,
+                               linalg::Conv2DNchwFchwOp namedOp,
                                transform::ApplyToEachResultList &results,
                                transform::TransformState &state) {
 
-  // 1. Get context and namedOp params
+  // Get context and namedOp params
   MLIRContext *context = rewriter.getContext();
   Location loc = namedOp.getLoc();
 
@@ -138,30 +143,44 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
   auto filterType = cast<ShapedType>(filter.getType());
   auto outputType = cast<ShapedType>(output.getType());
 
+  if (!filterType.hasStaticShape())
+    return emitSilenceableError() << "expected a static shape for the filter";
+
+  if (!inputType.hasStaticShape())
+    return emitSilenceableError() << "expected a static shape for the input";
+
+  // Does not support dilation.
+  if (!hasAllOneValues(namedOp.getDilations()))
+    return emitSilenceableError() << "expected all ones for dilations";
+
   auto outputShape = outputType.getShape();
   int64_t n = outputShape[0];
   int64_t oc = outputShape[1];
   int64_t oh = outputShape[2];
   int64_t ow = outputShape[3];
 
-  // 2. Create the Collapse shape to be inserted at begining
+  // Create the Collapse shape to be inserted at begining
   SmallVector<ReassociationIndices> outputReassocIndices = {{0}, {1}, {2, 3}};
   auto reshapedOutputType = RankedTensorType::get({n, oc, oh * ow}, outputType.getElementType());
   Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
       loc, reshapedOutputType, output, outputReassocIndices);
 
-  // 3. Create the affine maps, iterator types and output tensor shape
+  // Create the affine maps, iterator types and output tensor shape
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
   SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
 
-  AffineExpr d0, d1, d3, d4, d5, d6;
-  bindDims(context, d0, d1, d3, d4, d5, d6);
-  auto lhsMap = AffineMap::get(6, 0, {d0, d4, d3.floorDiv(oh) + d5, d3 % oh + d6}, context);
-  auto rhsMap = AffineMap::get(6, 0, {d1, d4, d5, d6}, context);
-  auto resultMap = AffineMap::get(6, 0, {d0, d1, d3}, context);
+  // Get strides
+  auto hstride = namedOp.getStrides().getValues<int64_t>()[0];
+  auto wstride = namedOp.getStrides().getValues<int64_t>()[1];
 
-  // 4. Create the new generic Op
+  AffineExpr d0, d1, d2, d3, d4, d5;
+  bindDims(context, d0, d1, d2, d3, d4, d5);
+  auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) * hstride + d4, d2 % oh * wstride + d5}, context);
+  auto rhsMap = AffineMap::get(6, 0, {d1, d3, d4, d5}, context);
+  auto resultMap = AffineMap::get(6, 0, {d0, d1, d2}, context);
+
+  // Create the new generic Op
   auto genericOp = rewriter.create<linalg::GenericOp>(
       loc,
       reshapedOutputType,
@@ -177,16 +196,15 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
 
   Value result = genericOp.getResults().front();
 
-  // 5. Create the Expanded Shape to be inserted after the genericOp
-  auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(
-      loc, outputType, result, outputReassocIndices);
+  // Create the Expanded Shape to be inserted after the genericOp
+  auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, result, outputReassocIndices);
 
-  // 6. Replace the namedOp to genericOp
+  // Replace the namedOp to genericOp
   rewriter.replaceOp(namedOp, ArrayRef<Value>{reshapedResult});
 
-  // 6. Call the CSA Analysis
+  // Call the CSA Analysis
   
-  // 7. Call the mlir::transform::TileUsingForOp (...) twice
+  // Call the mlir::transform::TileUsingForOp (...) twice
 
   // If everything went well, return success.
 

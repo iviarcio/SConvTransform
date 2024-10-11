@@ -202,13 +202,31 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
   // Replace the namedOp to genericOp
   rewriter.replaceOp(namedOp, ArrayRef<Value>{reshapedResult});
 
-  // Call the CSA Analysis
+  // results.push_back(genericOp);
+
+  // TODO: Call the CSA Analysis
   
-  // Call the mlir::transform::TileUsingForOp (...) twice
+  // For now, define the tile sizes and interchange as constants
+  SmallVector<int64_t, 6> tileSize = {1, 64, 32, 16, 0, 0};
+  SmallVector<int64_t, 4> tileInterchange = {0, 3, 2, 1};
 
-  // If everything went well, return success.
+  // Create attributes for static tile sizes and interchange
+  auto tileSizeAttr = rewriter.getDenseI64ArrayAttr(tileSize);
+  auto interchangeAttr = rewriter.getDenseI64ArrayAttr(tileInterchange);
 
-  results.push_back(genericOp);
+  // Create TileUsingForOp using the builder
+  auto tileOp = rewriter.create<transform::TileUsingForOp>(
+    rewriter.getUnknownLoc(), 
+    genericOp.getResultTypes(),        // Result types of the operation
+    genericOp,                         // The operation to tile
+    /* dynamic_sizes */ ValueRange(),  // Empty ValueRange for static tiling
+    tileSizeAttr,                      // Static tile sizes
+    interchangeAttr);                  // Interchange attribute
+
+  if (!tileOp)
+    return emitSilenceableError() << "sconv tiling failure";
+
+  results.push_back(tileOp);
 
   return DiagnosedSilenceableFailure::success();
 }

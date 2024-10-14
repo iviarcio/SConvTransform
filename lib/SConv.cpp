@@ -201,8 +201,7 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
 
   // Replace the namedOp to genericOp
   rewriter.replaceOp(namedOp, ArrayRef<Value>{reshapedResult});
-
-  // results.push_back(genericOp);
+  // Check point:  results.push_back(genericOp);
 
   // TODO: Call the CSA Analysis
   
@@ -214,12 +213,13 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
   auto tileSizeAttr = rewriter.getDenseI64ArrayAttr(tileSize);
   auto interchangeAttr = rewriter.getDenseI64ArrayAttr(tileInterchange);
 
+  // Set the insertion point in genericOp
+  rewriter.setInsertionPoint(genericOp);
+
   // Create TileUsingForOp using the builder
   auto tileOp = rewriter.create<transform::TileUsingForOp>(
-    rewriter.getUnknownLoc(), 
-    genericOp.getResultTypes(),        // Result types of the operation
-    genericOp,                         // The operation to tile
-    /* dynamic_sizes */ ValueRange(),  // Empty ValueRange for static tiling
+    rewriter.getUnknownLoc(),          // Location  
+    genericOp.getResult(0),            // The operation to tile ?
     tileSizeAttr,                      // Static tile sizes
     interchangeAttr);                  // Interchange attribute
 

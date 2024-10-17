@@ -124,10 +124,10 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
 
 // Implementation of SConv transform dialect operation.
 DiagnosedSilenceableFailure
-transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
-                               linalg::Conv2DNchwFchwOp namedOp,
-                               transform::ApplyToEachResultList &results,
-                               transform::TransformState &state) {
+transform::SConvOp::apply(transform::TransformRewriter &rewriter,
+                          linalg::Conv2DNchwFchwOp namedOp,
+                          transform::TransformResults &results,
+                          transform::TransformState &state) {
 
   // Get context and namedOp params
   MLIRContext *context = rewriter.getContext();
@@ -180,7 +180,7 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
   auto rhsMap = AffineMap::get(6, 0, {d1, d3, d4, d5}, context);
   auto resultMap = AffineMap::get(6, 0, {d0, d1, d2}, context);
 
-  // Create the new generic Op
+  // Create the new genericOp that replaces the namedOp
   auto genericOp = rewriter.create<linalg::GenericOp>(
       loc,
       reshapedOutputType,
@@ -194,14 +194,13 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
-  Value result = genericOp.getResults().front();
+  Value res = genericOp.getResults().front();
 
   // Create the Expanded Shape to be inserted after the genericOp
-  auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, result, outputReassocIndices);
+  auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, res, outputReassocIndices);
 
   // Replace the namedOp to genericOp
   rewriter.replaceOp(namedOp, ArrayRef<Value>{reshapedResult});
-  // Check point:  results.push_back(genericOp);
 
   // TODO: Call the CSA Analysis
   
@@ -214,21 +213,33 @@ transform::SConvOp::applyToOne(transform::TransformRewriter &rewriter,
   auto interchangeAttr = rewriter.getDenseI64ArrayAttr(tileInterchange);
 
   // Set the insertion point in genericOp
-  rewriter.setInsertionPoint(genericOp);
+  rewriter.setInsertionPointAfter(genericOp);
 
   // Create TileUsingForOp using the builder
-  auto tileOp = rewriter.create<transform::TileUsingForOp>(
+  auto tiledOp = rewriter.create<transform::TileUsingForOp>(
     rewriter.getUnknownLoc(),          // Location  
     genericOp.getResult(0),            // The operation to tile ?
     tileSizeAttr,                      // Static tile sizes
     interchangeAttr);                  // Interchange attribute
 
-  if (!tileOp)
-    return emitSilenceableError() << "sconv tiling failure";
+  // Apply the tiling transformation using apply method
+  DiagnosedSilenceableFailure status =  tiledOp.apply(rewriter, results, state); 
+  if (!status.succeeded())
+    return status;
 
-  results.push_back(tileOp);
+  // Substitui a operação original
+  rewriter.replaceOp(genericOp, tiledOp.getResults());
+
+  // Remove a operação original ?
+  rewriter.eraseOp(genericOp);
 
   return DiagnosedSilenceableFailure::success();
+}
+
+void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getTargetMutable(), effects);
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
 }
 
 void registerSConv(mlir::DialectRegistry &registry) {

@@ -26,11 +26,9 @@ include "mlir/IR/RegionKindInterface.td"
 // Define the sconv operation. By convention, prefix its name with the name of the 
 // extension, "structured.". The full op name will be further prefixed with "transform.".
 def SConvOp : Op<Transform_Dialect, "structured.sconv",
-    // Indicate that the operation implements the required TransformOpInterface and
-    // MemoryEffectsOpInterface.
-    [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
-     TransformOpInterface, TransformEachOpTrait,
-     ReportTrackingListenerFailuresOpTrait]> {
+       [DeclareOpInterfaceMethods<TransformOpInterface>,
+        DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+        ReportTrackingListenerFailuresOpTrait]> {
 
   // Provide a brief and a full description of SConvOp. It is recommended describing 
   // the effects on the operands and how the operation processes various failure modes.
@@ -53,10 +51,10 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
   let results = (outs TransformHandleTypeInterface:$transformed);
 
   let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
+    ::mlir::DiagnosedSilenceableFailure apply(
         ::mlir::transform::TransformRewriter &rewriter,
         ::mlir::linalg::Conv2DNchwFchwOp namedOp,
-        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformResults &results,
         ::mlir::transform::TransformState &state);
   }];
 

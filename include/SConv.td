@@ -28,7 +28,16 @@ include "mlir/IR/RegionKindInterface.td"
 def SConvOp : Op<Transform_Dialect, "structured.sconv",
        [DeclareOpInterfaceMethods<TransformOpInterface>,
         DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+        TransformEachOpTrait,
+        FunctionalStyleTransformOpTrait,
         ReportTrackingListenerFailuresOpTrait]> {
+
+       // [TransformOpInterface,
+       //  MemoryEffectsOpInterface,
+       //  TransformEachOpTrait,
+       //  FunctionalStyleTransformOpTrait,
+       //  ReportTrackingListenerFailuresOpTrait]> {
+
 
   // Provide a brief and a full description of SConvOp. It is recommended describing 
   // the effects on the operands and how the operation processes various failure modes.

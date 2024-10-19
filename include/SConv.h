@@ -22,6 +22,7 @@
 #include "mlir/IR/RegionKindInterface.h"
 
 namespace mlir {
+class CallOpInterface;
 class RewriterBase;
 
 namespace linalg {

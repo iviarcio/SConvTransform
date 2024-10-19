@@ -39,15 +39,19 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 
+#include "mlir/IR/DialectImplementation.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+
 using namespace mlir;
 using namespace mlir::linalg;
 
 #define DEBUG_TYPE "sconv-transform"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 
-namespace {
-// Define a new transform dialect extension. This uses the CRTP idiom to
-// identify extensions.
+#define GET_OP_CLASSES
+#include "SConv.cpp.inc"
+
+// Define the SConv transform dialect. This uses the CRTP idiom to identify extensions.
 class SConv
     : public transform::TransformDialectExtension<SConv> {
 public:
@@ -94,10 +98,6 @@ void SConv::init() {
 #include "SConv.cpp.inc"
       >();
 }
-} // namespace
-
-#define GET_OP_CLASSES
-#include "SConv.cpp.inc"
 
 static bool hasAllOneValues(DenseIntElementsAttr attr) {
   return llvm::all_of(
@@ -122,7 +122,7 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
   return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
 }
 
-// Implementation of SConv transform dialect operation.
+// Implementation of SConv::apply transform dialect operation.
 DiagnosedSilenceableFailure
 transform::SConvOp::apply(transform::TransformRewriter &rewriter,
                           linalg::Conv2DNchwFchwOp namedOp,
@@ -234,6 +234,13 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   rewriter.eraseOp(genericOp);
 
   return DiagnosedSilenceableFailure::success();
+}
+
+DiagnosedSilenceableFailure
+transform::SConvOp::apply(transform::TransformRewriter &rewriter,
+                          transform::TransformResults &results,
+                          transform::TransformState &state) {
+    return emitSilenceableError() << "expected a conv2d nchw convolution";
 }
 
 void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

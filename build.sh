@@ -4,6 +4,6 @@ cmake -G Ninja .. \
    -DCMAKE_CXX_COMPILER=clang++ \
    -DCMAKE_BUILD_TYPE=Debug \
    -DLLVM_ENABLE_LLD=ON \
-   -DMLIR_DIR=/home/marcio/llvm-project/build/lib/cmake/mlir \
-   -DLLVM_DIR=/home/marcio/llvm-project/build/lib/cmake/llvm
+   -DMLIR_DIR=$HOME/work/llvm-project/build/lib/cmake/mlir \
+   -DLLVM_DIR=$HOME/work/llvm-project/build/lib/cmake/llvm
 cmake --build . --target transform-opt

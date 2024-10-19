@@ -3,8 +3,8 @@ project(SConvDialect LANGUAGES CXX)
 add_custom_target(SConv)
 
 # Defina o caminho para o LLVM e MLIR
-set(LLVM_DIR /home/marcio/work/llvm-project/build/lib/cmake/llvm)
-set(MLIR_DIR /home/marcio/work/llvm-project/build/lib/cmake/mlir)
+set(LLVM_DIR $HOME/work/llvm-project/build/lib/cmake/llvm)
+set(MLIR_DIR $HOME/work/llvm-project/build/lib/cmake/mlir)
 
 find_package(LLVM REQUIRED CONFIG)
 find_package(MLIR REQUIRED CONFIG)

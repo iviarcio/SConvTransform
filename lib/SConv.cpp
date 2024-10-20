@@ -125,12 +125,19 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
 // Implementation of SConv::apply transform dialect operation.
 DiagnosedSilenceableFailure
 transform::SConvOp::apply(transform::TransformRewriter &rewriter,
-                          linalg::Conv2DNchwFchwOp namedOp,
                           transform::TransformResults &results,
                           transform::TransformState &state) {
 
   // Get context and namedOp params
   MLIRContext *context = rewriter.getContext();
+  auto targetOps = state.getPayloadOps(getTarget());
+
+  assert(llvm::hasSingleElement(targetOps) && "expected a single target op");
+
+  auto namedOp = dyn_cast_or_null<linalg::Conv2DNchwFchwOp>(*targetOps.begin());
+  if (!namedOp)  
+    return emitSilenceableError() << "expected a Conv2DNchwFchwOp for transformation";
+
   Location loc = namedOp.getLoc();
 
   SmallVector<Value> inputs = namedOp.getDpsInputs();
@@ -218,7 +225,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   // Create TileUsingForOp using the builder
   auto tiledOp = rewriter.create<transform::TileUsingForOp>(
     rewriter.getUnknownLoc(),          // Location  
-    genericOp.getResult(0),            // The operation to tile ?
+    genericOp.getResult(0),            // The operation to tile
     tileSizeAttr,                      // Static tile sizes
     interchangeAttr);                  // Interchange attribute
 
@@ -234,13 +241,6 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   rewriter.eraseOp(genericOp);
 
   return DiagnosedSilenceableFailure::success();
-}
-
-DiagnosedSilenceableFailure
-transform::SConvOp::apply(transform::TransformRewriter &rewriter,
-                          transform::TransformResults &results,
-                          transform::TransformState &state) {
-    return emitSilenceableError() << "expected a conv2d nchw convolution";
 }
 
 void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

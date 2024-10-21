@@ -60,9 +60,12 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
         ::mlir::transform::TransformState &state);
   }];
 
-  let assemblyFormat =
-      "$target attr-dict `:` "
-      "custom<SemiFunctionType>(type($target), type($transformed))";
+  let assemblyFormat = [{
+    $target
+    attr-dict
+    `:` functional-type(operands, results)
+  }];
+
 }
 
 #endif // SCONV

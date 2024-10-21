@@ -246,12 +246,6 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   // Replace the namedOp to genericOp
   rewriter.replaceOp(namedOp, ArrayRef<Value>{reshapedResult});
 
-  // checkpoint
-  SmallVector<Operation *> op;
-  op.push_back(genericOp.getOperation());
-  results.set(getOperation()->getOpResult(0), op);
-  // end checkpoint
-
   // TODO: Call the CSA Analysis
   
   // For now, define the tile sizes and interchange as constants

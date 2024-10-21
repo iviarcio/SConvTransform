@@ -28,6 +28,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/AffineExpr.h"
@@ -120,6 +121,44 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
   if (isa<IntegerType>(accType))
     return builder.create<arith::MulIOp>(loc, xConvert, yConvert);
   return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
+}
+
+// Apply a tiling transformation to a modified payload ops and store both the
+/// tiled operation as well as the created tile loops.
+static LogicalResult
+applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
+            ArrayRef<OpFoldResult> tileSizes, ArrayRef<int64_t> interchange,
+            transform::TransformResults &transformResults) {
+
+  SmallVector<Operation *> tiledOps;
+  SmallVector<Operation *> loopOps;
+
+  auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
+  if (!tilingInterfaceOp)
+    return transformOp->emitError("only TilingInterface ops are supported");
+  scf::SCFTilingOptions tilingOptions;
+  tilingOptions.setTileSizes(tileSizes).setInterchange(interchange);
+  tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+
+  rewriter.setInsertionPoint(target);
+  FailureOr<scf::SCFTilingResult> tiledResults =
+      scf::tileUsingSCF(rewriter, tilingInterfaceOp, tilingOptions);
+  if (failed(tiledResults))
+    return failure();
+
+  // Perform the replacement of tiled and fused values.
+  rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
+
+  // Report back the relevant handles to the transform op.
+  tiledOps.push_back(tiledResults->tiledOps.front());
+  for (Operation *loop : tiledResults->loops)
+    loopOps.push_back(loop);
+
+  transformResults.set(transformOp->getOpResult(0), tiledOps);
+  for (auto [index, loop] : llvm::enumerate(loopOps))
+    transformResults.set(transformOp->getOpResult(index + 1), {loop});
+
+  return success();
 }
 
 // Implementation of SConv::apply transform dialect operation.
@@ -219,32 +258,14 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   SmallVector<int64_t, 6> tileSize = {1, 64, 32, 16, 0, 0};
   SmallVector<int64_t, 4> tileInterchange = {0, 3, 2, 1};
 
-  // Create attributes for static tile sizes and interchange
-  auto tileSizeAttr = rewriter.getDenseI64ArrayAttr(tileSize);
-  auto interchangeAttr = rewriter.getDenseI64ArrayAttr(tileInterchange);
+  SmallVector<OpFoldResult> tileSizesOfr =
+      getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
 
-  // Set the insertion point in genericOp
-  rewriter.setInsertionPointAfter(genericOp);
+  LogicalResult result =
+      applyTileTo(rewriter, getOperation(), genericOp, tileSizesOfr, tileInterchange, results);
 
-  // Create TileUsingForOp using the builder
-  auto tiledOp = rewriter.create<transform::TileUsingForOp>(
-    rewriter.getUnknownLoc(),          // Location  
-    genericOp.getResult(0),            // The operation to tile
-    tileSizeAttr,                      // Static tile sizes
-    interchangeAttr);                  // Interchange attribute
-
-  // Apply the tiling transformation using apply method
-  DiagnosedSilenceableFailure status =  tiledOp.apply(rewriter, results, state); 
-  if (!status.succeeded())
-    return status;
-
-  // Substitui a operação original
-  // rewriter.replaceOp(genericOp, tiledOp.getResults().front);
-
-  // Remove a operação original ?
-  // rewriter.eraseOp(genericOp);
-
-  return DiagnosedSilenceableFailure::success();
+  return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
+                        : DiagnosedSilenceableFailure::success();
 }
 
 void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

@@ -201,13 +201,17 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
-  Value res = genericOp.getResults().front();
-
   // Create the Expanded Shape to be inserted after the genericOp
-  auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, res, outputReassocIndices);
+  auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
 
   // Replace the namedOp to genericOp
   rewriter.replaceOp(namedOp, ArrayRef<Value>{reshapedResult});
+
+  // checkpoint
+  SmallVector<Operation *> op;
+  op.push_back(genericOp.getOperation());
+  results.set(getOperation()->getOpResult(0), op);
+  // end checkpoint
 
   // TODO: Call the CSA Analysis
   
@@ -235,10 +239,10 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     return status;
 
   // Substitui a operação original
-  rewriter.replaceOp(genericOp, tiledOp.getResults());
+  // rewriter.replaceOp(genericOp, tiledOp.getResults().front);
 
   // Remove a operação original ?
-  rewriter.eraseOp(genericOp);
+  // rewriter.eraseOp(genericOp);
 
   return DiagnosedSilenceableFailure::success();
 }

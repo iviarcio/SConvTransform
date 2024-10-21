@@ -50,7 +50,8 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
   // The handle must implement TransformHandleTypeInterface.   
   let arguments = (ins TransformHandleTypeInterface:$target);
 
-  let results = (outs TransformHandleTypeInterface:$transformed);
+  let results = (outs TransformHandleTypeInterface:$transformed,
+                      Variadic<TransformHandleTypeInterface>:$loops);
 
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure apply(

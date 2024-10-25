@@ -45,6 +45,7 @@
 
 using namespace mlir;
 using namespace mlir::linalg;
+using namespace mlir::transform;
 
 #define DEBUG_TYPE "sconv-transform"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -125,38 +126,49 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
 
 // Apply a tiling transformation to a modified payload ops and store both the
 /// tiled operation as well as the created tile loops.
+template <typename Range>
 static LogicalResult
-applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
+applyTileTo(RewriterBase &rewriter, Operation *transformOp, Range &&payloadOps,
             ArrayRef<OpFoldResult> tileSizes, ArrayRef<int64_t> interchange,
             transform::TransformResults &transformResults) {
 
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> loopOps;
 
-  auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
-  if (!tilingInterfaceOp)
-    return transformOp->emitError("only TilingInterface ops are supported");
-  scf::SCFTilingOptions tilingOptions;
-  tilingOptions.setTileSizes(tileSizes).setInterchange(interchange);
-  tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+  for (Operation *target : payloadOps) {
+    auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
+    if (!tilingInterfaceOp)
+      return transformOp->emitError("only TilingInterface ops are supported");
+    scf::SCFTilingOptions tilingOptions;
+    tilingOptions.setTileSizes(tileSizes).setInterchange(interchange);
+    tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
-  rewriter.setInsertionPoint(target);
-  FailureOr<scf::SCFTilingResult> tiledResults =
-      scf::tileUsingSCF(rewriter, tilingInterfaceOp, tilingOptions);
-  if (failed(tiledResults))
-    return failure();
+    LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'target before tiling': " << tilingInterfaceOp;);
 
-  // Perform the replacement of tiled and fused values.
-  rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
+    rewriter.setInsertionPoint(target);
+    FailureOr<scf::SCFTilingResult> tiledResults =
+        scf::tileUsingSCF(rewriter, tilingInterfaceOp, tilingOptions);
+    if (failed(tiledResults))
+      return failure();
 
-  // Report back the relevant handles to the transform op.
-  tiledOps.push_back(tiledResults->tiledOps.front());
-  for (Operation *loop : tiledResults->loops)
-    loopOps.push_back(loop);
+    // Perform the replacement of tiled and fused values.
+    rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
+    // rewriter.replaceOp(target, tiledResults->replacements);
+
+    // Report back the relevant handles to the transform op.
+    tiledOps.push_back(tiledResults->tiledOps.front());
+    for (Operation *loop : tiledResults->loops)
+      loopOps.push_back(loop);
+    
+    LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'Result of tile': " << *tiledOps[0];);
+  }
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))
     transformResults.set(transformOp->getOpResult(index + 1), {loop});
+
+  for (const auto &en : llvm::enumerate(loopOps)) 
+    LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'Loops': " <<  *en.value());
 
   return success();
 }
@@ -167,20 +179,20 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
                           transform::TransformResults &results,
                           transform::TransformState &state) {
 
-  // Get context and namedOp params
+  // Get context and convOp params
   MLIRContext *context = rewriter.getContext();
   auto targetOps = state.getPayloadOps(getTarget());
 
   assert(llvm::hasSingleElement(targetOps) && "expected a single target op");
 
-  auto namedOp = dyn_cast_or_null<linalg::Conv2DNchwFchwOp>(*targetOps.begin());
-  if (!namedOp)  
+  auto convOp = dyn_cast_or_null<linalg::Conv2DNchwFchwOp>(*targetOps.begin());
+  if (!convOp)  
     return emitSilenceableError() << "expected a Conv2DNchwFchwOp for transformation";
 
-  Location loc = namedOp.getLoc();
+  Location loc = convOp.getLoc();
 
-  SmallVector<Value> inputs = namedOp.getDpsInputs();
-  ValueRange outputs = namedOp.getDpsInits();
+  SmallVector<Value> inputs = convOp.getDpsInputs();
+  ValueRange outputs = convOp.getDpsInits();
   Value input = inputs[0];
   Value filter = inputs[1];
   Value output = outputs[0];
@@ -196,7 +208,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     return emitSilenceableError() << "expected a static shape for the input";
 
   // Does not support dilation.
-  if (!hasAllOneValues(namedOp.getDilations()))
+  if (!hasAllOneValues(convOp.getDilations()))
     return emitSilenceableError() << "expected all ones for dilations";
 
   auto outputShape = outputType.getShape();
@@ -211,14 +223,16 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
       loc, reshapedOutputType, output, outputReassocIndices);
 
+  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'Collapsed shape': " << reshapedOutput;);
+
   // Create the affine maps, iterator types and output tensor shape
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
   SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
 
   // Get strides
-  auto hstride = namedOp.getStrides().getValues<int64_t>()[0];
-  auto wstride = namedOp.getStrides().getValues<int64_t>()[1];
+  auto hstride = convOp.getStrides().getValues<int64_t>()[0];
+  auto wstride = convOp.getStrides().getValues<int64_t>()[1];
 
   AffineExpr d0, d1, d2, d3, d4, d5;
   bindDims(context, d0, d1, d2, d3, d4, d5);
@@ -226,7 +240,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   auto rhsMap = AffineMap::get(6, 0, {d1, d3, d4, d5}, context);
   auto resultMap = AffineMap::get(6, 0, {d0, d1, d2}, context);
 
-  // Create the new genericOp that replaces the namedOp
+  // Create the new genericOp that replaces the convOp
   auto genericOp = rewriter.create<linalg::GenericOp>(
       loc,
       reshapedOutputType,
@@ -240,11 +254,17 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
+  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'GenericOp before': " << genericOp;);
+
   // Create the Expanded Shape to be inserted after the genericOp
   auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
 
-  // Replace the namedOp to genericOp
-  rewriter.replaceOp(namedOp, ArrayRef<Value>{reshapedResult});
+  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'Expanded Shape': " << reshapedResult;);
+
+  // Replace the convOp to genericOp
+  rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
+
+  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'convOp after generalized': " << genericOp;);
 
   // TODO: Call the CSA Analysis
   
@@ -256,7 +276,10 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
       getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
 
   LogicalResult result =
-      applyTileTo(rewriter, getOperation(), genericOp, tileSizesOfr, tileInterchange, results);
+      // applyTileTo(rewriter, getOperation(), genericOp, tileSizesOfr, tileInterchange, results);
+      applyTileTo(rewriter, getOperation(), state.getPayloadOps(getTarget()), tileSizesOfr, tileInterchange, results);
+
+  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'genericOp after tiling': " << genericOp;);
 
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();

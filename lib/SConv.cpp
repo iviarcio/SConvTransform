@@ -219,8 +219,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   auto outputShape = outputType.getShape();
   int64_t n = outputShape[0];
   int64_t ic = inputShape[1];
-  int64_t fh = filterShape[3];
-  int64_t fw = filterShape[4];
+  int64_t fh = filterShape[2];
+  int64_t fw = filterShape[3];
   int64_t oc = outputShape[1];
   int64_t oh = outputShape[2];
   int64_t ow = outputShape[3];

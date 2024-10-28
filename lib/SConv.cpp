@@ -126,9 +126,7 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
 
 // Apply a tiling transformation to a modified payload ops and store both the
 /// tiled operation as well as the created tile loops.
-// template <typename Range>
 static LogicalResult
-// applyTileTo(RewriterBase &rewriter, Operation *transformOp, Range &&payloadOps,
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
             ArrayRef<OpFoldResult> tileSizes, ArrayRef<int64_t> interchange,
             transform::TransformResults &transformResults) {
@@ -136,40 +134,38 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> loopOps;
 
-  // for (Operation *target : payloadOps) {
-    auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
-    if (!tilingInterfaceOp)
-      return transformOp->emitError("only TilingInterface ops are supported");
-    scf::SCFTilingOptions tilingOptions;
-    tilingOptions.setTileSizes(tileSizes).setInterchange(interchange);
-    tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+  auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
+  if (!tilingInterfaceOp)
+    return transformOp->emitError("only TilingInterface ops are supported");
+  scf::SCFTilingOptions tilingOptions;
+  tilingOptions.setTileSizes(tileSizes).setInterchange(interchange);
+  tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
-    LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'target before tiling': " << tilingInterfaceOp;);
+  DBGS() << "target before tiling: " << tilingInterfaceOp;
 
-    rewriter.setInsertionPoint(target);
-    FailureOr<scf::SCFTilingResult> tiledResults =
-        scf::tileUsingSCF(rewriter, tilingInterfaceOp, tilingOptions);
-    if (failed(tiledResults))
-      return failure();
+  rewriter.setInsertionPoint(target);
+  FailureOr<scf::SCFTilingResult> tiledResults =
+      scf::tileUsingSCF(rewriter, tilingInterfaceOp, tilingOptions);
+  if (failed(tiledResults))
+    return failure();
 
-    // Perform the replacement of tiled and fused values.
-    rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
-    // rewriter.replaceOp(target, tiledResults->replacements);
+  // Perform the replacement of tiled and fused values.
+  rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
+  // rewriter.replaceOp(target, tiledResults->replacements);
 
-    // Report back the relevant handles to the transform op.
-    tiledOps.push_back(tiledResults->tiledOps.front());
-    for (Operation *loop : tiledResults->loops)
-      loopOps.push_back(loop);
-    
-    LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'Result of tile': " << *tiledOps[0];);
-  // }
+  // Report back the relevant handles to the transform op.
+  tiledOps.push_back(tiledResults->tiledOps.front());
+  for (Operation *loop : tiledResults->loops)
+    loopOps.push_back(loop);
+  
+  DBGS() << "Result of tile: " << *tiledOps[0];
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))
     transformResults.set(transformOp->getOpResult(index + 1), {loop});
 
   for (const auto &en : llvm::enumerate(loopOps)) 
-    LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'Loops': " <<  *en.value());
+    DBGS() << "Loops: " <<  *en.value();
 
   return success();
 }
@@ -224,7 +220,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
       loc, reshapedOutputType, output, outputReassocIndices);
 
-  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'Collapsed shape': " << reshapedOutput;);
+  DBGS() << "Collapsed shape: " << reshapedOutput;
 
   // Create the affine maps, iterator types and output tensor shape
   auto parallel = utils::IteratorType::parallel;
@@ -255,17 +251,17 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
-  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'GenericOp before': " << genericOp;);
+  DBGS() << "GenericOp before: " << genericOp;
 
   // Create the Expanded Shape to be inserted after the genericOp
   auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
 
-  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'Expanded Shape': " << reshapedResult;);
+  DBGS() << "Expanded Shape: " << reshapedResult;
 
   // Replace the convOp to genericOp
   rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
 
-  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'convOp after generalized': " << genericOp;);
+  DBGS() << "convOp after generalized: " << genericOp;
 
   // TODO: Call the CSA Analysis
   
@@ -277,16 +273,23 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
       getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
 
   auto op = getOperation();
-  DBGS() << "getOperation: " << op;
-
   LogicalResult result =
       applyTileTo(rewriter, op, genericOp, tileSizesOfr, tileInterchange, results);
       // applyTileTo(rewriter, getOperation(), state.getPayloadOps(getTarget()), tileSizesOfr, tileInterchange, results);
 
-  LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'genericOp after tiling': " << genericOp;);
+  DBGS() << "genericOp after tiling: " << genericOp;
 
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();
+
+  // SmallVector<Operation *> genOps;
+  // genOps.push_back(genericOp);
+  // SmallVector<Operation *> loopOps(4, nullptr);
+  // results.set(op->getOpResult(0), genOps);
+  // for (auto [index, loop] : llvm::enumerate(loopOps))
+  //   results.set(op->getOpResult(index + 1), {loop});
+  // return DiagnosedSilenceableFailure::success();
+
 }
 
 void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

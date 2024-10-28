@@ -48,7 +48,7 @@ using namespace mlir::linalg;
 using namespace mlir::transform;
 
 #define DEBUG_TYPE "sconv-transform"
-#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define DBGS() (llvm::dbgs() << "\n[" DEBUG_TYPE "]: ")
 
 #define GET_OP_CLASSES
 #include "SConv.cpp.inc"
@@ -126,16 +126,17 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
 
 // Apply a tiling transformation to a modified payload ops and store both the
 /// tiled operation as well as the created tile loops.
-template <typename Range>
+// template <typename Range>
 static LogicalResult
-applyTileTo(RewriterBase &rewriter, Operation *transformOp, Range &&payloadOps,
+// applyTileTo(RewriterBase &rewriter, Operation *transformOp, Range &&payloadOps,
+applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
             ArrayRef<OpFoldResult> tileSizes, ArrayRef<int64_t> interchange,
             transform::TransformResults &transformResults) {
 
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> loopOps;
 
-  for (Operation *target : payloadOps) {
+  // for (Operation *target : payloadOps) {
     auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
     if (!tilingInterfaceOp)
       return transformOp->emitError("only TilingInterface ops are supported");
@@ -161,7 +162,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Range &&payloadOps,
       loopOps.push_back(loop);
     
     LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'Result of tile': " << *tiledOps[0];);
-  }
+  // }
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))
@@ -275,9 +276,12 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   SmallVector<OpFoldResult> tileSizesOfr =
       getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
 
+  auto op = getOperation();
+  DBGS() << "getOperation: " << op;
+
   LogicalResult result =
-      // applyTileTo(rewriter, getOperation(), genericOp, tileSizesOfr, tileInterchange, results);
-      applyTileTo(rewriter, getOperation(), state.getPayloadOps(getTarget()), tileSizesOfr, tileInterchange, results);
+      applyTileTo(rewriter, op, genericOp, tileSizesOfr, tileInterchange, results);
+      // applyTileTo(rewriter, getOperation(), state.getPayloadOps(getTarget()), tileSizesOfr, tileInterchange, results);
 
   LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'genericOp after tiling': " << genericOp;);
 

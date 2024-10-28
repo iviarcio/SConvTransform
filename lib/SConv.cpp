@@ -12,6 +12,8 @@
 
 #include "SConv.h"
 
+#include "CSA.h"
+
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/IR/TransformOps.h"
@@ -212,8 +214,13 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   if (!hasAllOneValues(convOp.getDilations()))
     return emitSilenceableError() << "expected all ones for dilations";
 
+  auto inputShape = inputType.getShape();
+  auto filterShape = filterType.getShape();
   auto outputShape = outputType.getShape();
   int64_t n = outputShape[0];
+  int64_t ic = inputShape[1];
+  int64_t fh = filterShape[3];
+  int64_t fw = filterShape[4];
   int64_t oc = outputShape[1];
   int64_t oh = outputShape[2];
   int64_t ow = outputShape[3];
@@ -267,11 +274,26 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
 
   LLVM_DEBUG(llvm::dbgs() << "\n[SConv] 'convOp after generalized': " << genericOp;);
 
-  // TODO: Call the CSA Analysis
+  // Call the CSA Analysis
+  ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};
+  CSA csa = createCSAPass(csaConv);
+  CSAStrategy res = csa();
   
-  // For now, define the tile sizes and interchange as constants
-  SmallVector<int64_t, 6> tileSize = {1, 64, 32, 16, 0, 0};
-  SmallVector<int64_t, 4> tileInterchange = {0, 3, 2, 1};
+  // Assign tile sizes
+  // N, NF * K2/3, NWIN * K3/2, NC, FH, FW
+  int64_t nFTiles = csa.mK_.num_filters * (res.schd == IS ? res.k2 : res.k3);
+  int64_t nWinTiles = csa.mK_.nwindows * (res.schd == IS ? res.k3 : res.k2);
+  SmallVector<int64_t, 6> tileSize = {1, nFTiles, nWinTiles, res.tile_c, 0, 0};
+
+  // Order:
+  // Input Stationary: N, NC, NWIN, NF
+  // Weight Stationary: N, NC, NF, NWIN
+  int64_t nFOrder = res.schd == IS ? 3 : 2;
+  int64_t nWinOrder = res.schd == IS ? 2 : 3;
+  SmallVector<int64_t, 4> tileInterchange = {0, nFOrder, nWinOrder, 1};
+
+  // TODO: Second tiling level
+  // TODO: edge cases
 
   SmallVector<OpFoldResult> tileSizesOfr =
       getAsIndexOpFoldResult(rewriter.getContext(), tileSize);

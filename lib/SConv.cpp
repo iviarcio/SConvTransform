@@ -261,7 +261,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   // Replace the convOp to genericOp
   rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
 
-  DBGS() << "convOp after generalized: " << genericOp;
+  DBGS() << "convOp after generalized: " << genericOp << "\n";
 
   // TODO: Call the CSA Analysis
   
@@ -275,21 +275,11 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   auto op = getOperation();
   LogicalResult result =
       applyTileTo(rewriter, op, genericOp, tileSizesOfr, tileInterchange, results);
-      // applyTileTo(rewriter, getOperation(), state.getPayloadOps(getTarget()), tileSizesOfr, tileInterchange, results);
 
-  DBGS() << "genericOp after tiling: " << genericOp;
+  DBGS() << "genericOp after tiling: " << genericOp << "\n";
 
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();
-
-  // SmallVector<Operation *> genOps;
-  // genOps.push_back(genericOp);
-  // SmallVector<Operation *> loopOps(4, nullptr);
-  // results.set(op->getOpResult(0), genOps);
-  // for (auto [index, loop] : llvm::enumerate(loopOps))
-  //   results.set(op->getOpResult(index + 1), {loop});
-  // return DiagnosedSilenceableFailure::success();
-
 }
 
 void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

@@ -143,7 +143,9 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   tilingOptions.setTileSizes(tileSizes).setInterchange(interchange);
   tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
-  DBGS() << "target before tiling: " << tilingInterfaceOp;
+#ifndef NDEBUG
+  DBGS() << "Target before tiling: " << tilingInterfaceOp << "\n";
+#endif // NDEBUG
 
   rewriter.setInsertionPoint(target);
   FailureOr<scf::SCFTilingResult> tiledResults =
@@ -153,21 +155,24 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
 
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
-  // rewriter.replaceOp(target, tiledResults->replacements);
 
   // Report back the relevant handles to the transform op.
   tiledOps.push_back(tiledResults->tiledOps.front());
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
-  
+
+#ifndef NDEBUG
   DBGS() << "Result of tile: " << *tiledOps[0];
+#endif // NDEBUG
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))
     transformResults.set(transformOp->getOpResult(index + 1), {loop});
 
+#ifndef NDEBUG
   for (const auto &en : llvm::enumerate(loopOps)) 
     DBGS() << "Loops: " <<  *en.value();
+#endif // NDEBUG
 
   return success();
 }
@@ -189,6 +194,10 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     return emitSilenceableError() << "expected a Conv2DNchwFchwOp for transformation";
 
   Location loc = convOp.getLoc();
+
+#ifndef NDEBUG
+  DBGS() << "ConvOp: " << convOp << "\n";
+#endif // NDEBUG
 
   SmallVector<Value> inputs = convOp.getDpsInputs();
   ValueRange outputs = convOp.getDpsInits();
@@ -227,12 +236,14 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
       loc, reshapedOutputType, output, outputReassocIndices);
 
-  DBGS() << "Collapsed shape: " << reshapedOutput;
+#ifndef NDEBUG
+  DBGS() << "Collapsed shape: " << reshapedOutput << "\n";
+#endif // NDEBUG
 
   // Create the affine maps, iterator types and output tensor shape
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
-  SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
+  SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, parallel, reduction, reduction};
 
   // Get strides
   auto hstride = convOp.getStrides().getValues<int64_t>()[0];
@@ -258,17 +269,19 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
-  DBGS() << "GenericOp before: " << genericOp;
+#ifndef NDEBUG
+  DBGS() << "GenericOp: " << genericOp << "\n";
+#endif // NDEBUG
 
   // Create the Expanded Shape to be inserted after the genericOp
   auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
 
-  DBGS() << "Expanded Shape: " << reshapedResult;
+#ifndef NDEBUG
+  DBGS() << "Expanded Shape: " << reshapedResult << "\n";
+#endif // NDEBUG
 
-  // Replace the convOp to genericOp
+  // Replace the convOp to new "generic" Op with Collapsed & Expanded shapes
   rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
-
-  DBGS() << "convOp after generalized: " << genericOp << "\n";
 
   // Call the CSA Analysis
   ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};
@@ -298,10 +311,9 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   LogicalResult result =
       applyTileTo(rewriter, op, genericOp, tileSizesOfr, tileInterchange, results);
 
-  DBGS() << "genericOp after tiling: " << genericOp << "\n";
-
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();
+
 }
 
 void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

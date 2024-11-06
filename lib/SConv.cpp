@@ -161,18 +161,9 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
 
-#ifndef NDEBUG
-  DBGS() << "Result of tile: " << *tiledOps[0];
-#endif // NDEBUG
-
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))
     transformResults.set(transformOp->getOpResult(index + 1), {loop});
-
-#ifndef NDEBUG
-  for (const auto &en : llvm::enumerate(loopOps)) 
-    DBGS() << "Loops: " <<  *en.value();
-#endif // NDEBUG
 
   return success();
 }
@@ -269,6 +260,9 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
+  // Replace the convOp to new "generic" Op 
+  rewriter.replaceOp(convOp, genericOp);
+
 #ifndef NDEBUG
   DBGS() << "GenericOp: " << genericOp << "\n";
 #endif // NDEBUG
@@ -280,8 +274,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   DBGS() << "Expanded Shape: " << reshapedResult << "\n";
 #endif // NDEBUG
 
-  // Replace the convOp to new "generic" Op with Collapsed & Expanded shapes
-  rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
+  auto newOp = ArrayRef<Value>{reshapedResult};
+  rewriter.replaceOp(genericOp, newOp);
 
   // Call the CSA Analysis
   ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};
@@ -309,11 +303,11 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
 
   auto op = getOperation();
   LogicalResult result =
-      applyTileTo(rewriter, op, genericOp, tileSizesOfr, tileInterchange, results);
+      applyTileTo(rewriter, op, newOp, tileSizesOfr, tileInterchange, results);
+      // applyTileTo(rewriter, op, genericOp, tileSizesOfr, tileInterchange, results);
 
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();
-
 }
 
 void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

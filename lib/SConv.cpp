@@ -246,7 +246,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   auto rhsMap = AffineMap::get(6, 0, {d1, d3, d4, d5}, context);
   auto resultMap = AffineMap::get(6, 0, {d0, d1, d2}, context);
 
-  // Create the new genericOp that replaces the convOp
+  // Create the new genericOp that replaces the named convolution
   auto genericOp = rewriter.create<linalg::GenericOp>(
       loc,
       reshapedOutputType,
@@ -260,22 +260,17 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
-  // Replace the convOp to new "generic" Op 
-  rewriter.replaceOp(convOp, genericOp);
-
 #ifndef NDEBUG
   DBGS() << "GenericOp: " << genericOp << "\n";
 #endif // NDEBUG
 
-  // Create the Expanded Shape to be inserted after the genericOp
+  // Create the Expanded Shape to be inserted at the end of convOp
   auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
+  rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
 
 #ifndef NDEBUG
   DBGS() << "Expanded Shape: " << reshapedResult << "\n";
 #endif // NDEBUG
-
-  auto newOp = ArrayRef<Value>{reshapedResult};
-  rewriter.replaceOp(genericOp, newOp);
 
   // Call the CSA Analysis
   ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};
@@ -301,10 +296,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   SmallVector<OpFoldResult> tileSizesOfr =
       getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
 
-  auto op = getOperation();
   LogicalResult result =
-      applyTileTo(rewriter, op, newOp, tileSizesOfr, tileInterchange, results);
-      // applyTileTo(rewriter, op, genericOp, tileSizesOfr, tileInterchange, results);
+     applyTileTo(rewriter, getOperation(), genericOp, tileSizesOfr, tileInterchange, results);
 
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();

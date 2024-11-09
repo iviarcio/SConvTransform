@@ -184,11 +184,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   if (!convOp)  
     return emitSilenceableError() << "expected a Conv2DNchwFchwOp for transformation";
 
+  rewriter.setInsertionPoint(convOp);
   Location loc = convOp.getLoc();
-
-#ifndef NDEBUG
-  DBGS() << "ConvOp: " << convOp << "\n";
-#endif // NDEBUG
 
   SmallVector<Value> inputs = convOp.getDpsInputs();
   ValueRange outputs = convOp.getDpsInits();
@@ -264,13 +261,15 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   DBGS() << "GenericOp: " << genericOp << "\n";
 #endif // NDEBUG
 
-  // Create the Expanded Shape to be inserted at the end of convOp
+  // Create the Expanded Shape
   auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
-  rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
 
 #ifndef NDEBUG
   DBGS() << "Expanded Shape: " << reshapedResult << "\n";
 #endif // NDEBUG
+
+  // replace convOp with (reshapedOutput + genericOp + reshapedResult)
+  rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
 
   // Call the CSA Analysis
   ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};

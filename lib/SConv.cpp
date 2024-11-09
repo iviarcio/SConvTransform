@@ -231,7 +231,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   // Create the affine maps, iterator types and output tensor shape
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
-  SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, parallel, reduction, reduction};
+  SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
 
   // Get strides
   auto hstride = convOp.getStrides().getValues<int64_t>()[0];

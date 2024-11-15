@@ -224,10 +224,6 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
       loc, reshapedOutputType, output, outputReassocIndices);
 
-#ifndef NDEBUG
-  DBGS() << "Collapsed shape: " << reshapedOutput << "\n";
-#endif // NDEBUG
-
   // Create the affine maps, iterator types and output tensor shape
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
@@ -257,16 +253,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
       });
 
-#ifndef NDEBUG
-  DBGS() << "GenericOp: " << genericOp << "\n";
-#endif // NDEBUG
-
   // Create the Expanded Shape
   auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
-
-#ifndef NDEBUG
-  DBGS() << "Expanded Shape: " << reshapedResult << "\n";
-#endif // NDEBUG
 
   // replace convOp with (reshapedOutput + genericOp + reshapedResult)
   rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
@@ -288,9 +276,6 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   int64_t nFOrder = res.schd == IS ? 3 : 2;
   int64_t nWinOrder = res.schd == IS ? 2 : 3;
   SmallVector<int64_t, 4> tileInterchange = {0, nFOrder, nWinOrder, 1};
-
-  // TODO: Second tiling level
-  // TODO: edge cases
 
   SmallVector<OpFoldResult> tileSizesOfr =
       getAsIndexOpFoldResult(rewriter.getContext(), tileSize);

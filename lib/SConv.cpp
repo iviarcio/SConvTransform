@@ -130,8 +130,7 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
 /// tiled operation as well as the created tile loops.
 static LogicalResult
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
-            ArrayRef<OpFoldResult> tileSizes, ArrayRef<int64_t> interchange,
-            transform::TransformResults &transformResults) {
+            CSA csa, CSAStrategy res, transform::TransformResults &transformResults) {
 
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> loopOps;
@@ -139,13 +138,24 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
   if (!tilingInterfaceOp)
     return transformOp->emitError("only TilingInterface ops are supported");
-  scf::SCFTilingOptions tilingOptions;
-  tilingOptions.setTileSizes(tileSizes).setInterchange(interchange);
-  tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
-#ifndef NDEBUG
-  DBGS() << "Target before tiling: " << tilingInterfaceOp << "\n";
-#endif // NDEBUG
+  // Assign tile sizes
+  // N, NF * K2/3, NWIN * K3/2, NC, FH, FW
+  int64_t nFTiles = csa.mK_.num_filters * (res.schd == IS ? res.k2 : res.k3);
+  int64_t nWinTiles = csa.mK_.nwindows * (res.schd == IS ? res.k3 : res.k2);
+  SmallVector<int64_t, 6> tileSize = {1, nFTiles, nWinTiles, res.tile_c, 0, 0};
+  SmallVector<OpFoldResult> tileSizesOfr = getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
+
+  // Order:
+  // Input Stationary: N, NC, NWIN, NF
+  // Weight Stationary: N, NC, NF, NWIN
+  int64_t nFOrder = res.schd == IS ? 3 : 2;
+  int64_t nWinOrder = res.schd == IS ? 2 : 3;
+  SmallVector<int64_t, 4> tileInterchange = {0, nFOrder, nWinOrder, 1};
+
+  scf::SCFTilingOptions tilingOptions;
+  tilingOptions.setTileSizes(tileSizesOfr).setInterchange(tileInterchange);
+  tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
   rewriter.setInsertionPoint(target);
   FailureOr<scf::SCFTilingResult> tiledResults =
@@ -264,24 +274,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   CSA csa = createCSAPass(csaConv);
   CSAStrategy res = csa();
   
-  // Assign tile sizes
-  // N, NF * K2/3, NWIN * K3/2, NC, FH, FW
-  int64_t nFTiles = csa.mK_.num_filters * (res.schd == IS ? res.k2 : res.k3);
-  int64_t nWinTiles = csa.mK_.nwindows * (res.schd == IS ? res.k3 : res.k2);
-  SmallVector<int64_t, 6> tileSize = {1, nFTiles, nWinTiles, res.tile_c, 0, 0};
-
-  // Order:
-  // Input Stationary: N, NC, NWIN, NF
-  // Weight Stationary: N, NC, NF, NWIN
-  int64_t nFOrder = res.schd == IS ? 3 : 2;
-  int64_t nWinOrder = res.schd == IS ? 2 : 3;
-  SmallVector<int64_t, 4> tileInterchange = {0, nFOrder, nWinOrder, 1};
-
-  SmallVector<OpFoldResult> tileSizesOfr =
-      getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
-
   LogicalResult result =
-     applyTileTo(rewriter, getOperation(), genericOp, tileSizesOfr, tileInterchange, results);
+     applyTileTo(rewriter, getOperation(), genericOp, csa, res, results);
 
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();

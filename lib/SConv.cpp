@@ -126,8 +126,10 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
   return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
 }
 
-// Apply a tiling transformation to a modified payload ops and store both the
+///
+/// Apply a tiling transformation to a modified payload ops and store both the
 /// tiled operation as well as the created tile loops.
+///
 static LogicalResult
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
             CSA csa, CSAStrategy res, transform::TransformResults &transformResults) {
@@ -166,8 +168,36 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
 
+  // Now, perform the tiling in the inner convolution
+  auto innerOp = tiledResults->tiledOps.front();
+
+  SmallVector<int64_t, 6> innerTileSize = {0, csa.mK_.num_filters, csa.mK_.nwindows, 0, 0, 0};
+  SmallVector<OpFoldResult> innerTileSizesOfr = getAsIndexOpFoldResult(rewriter.getContext(), innerTileSize);
+
+  int64_t innerFOrder = res.schd == IS ? 1 : 0;
+  int64_t innerWinOrder = res.schd == IS ? 0 : 1;
+  SmallVector<int64_t, 2> innerInterchange = {innerFOrder, innerWinOrder};
+
+  auto innerTilingInterfaceOp = dyn_cast<TilingInterface>(innerOp);
+  if (!innerTilingInterfaceOp)
+    return transformOp->emitError("only TilingInterface ops are supported");
+  scf::SCFTilingOptions innerTilingOptions;
+  innerTilingOptions.setTileSizes(innerTileSizesOfr).setInterchange(innerInterchange);
+  innerTilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+
+  rewriter.setInsertionPoint(innerOp);
+  FailureOr<scf::SCFTilingResult> innerTiledResults =
+      scf::tileUsingSCF(rewriter, innerTilingInterfaceOp, innerTilingOptions);
+  if (failed(innerTiledResults))
+    return failure();
+
+  // Perform the replacement of tiled and fused values.
+  rewriter.replaceOp(innerTilingInterfaceOp, innerTiledResults->replacements);
+
   // Report back the relevant handles to the transform op.
-  tiledOps.push_back(tiledResults->tiledOps.front());
+  tiledOps.push_back(innerTiledResults->tiledOps.front());
+  for (Operation *loop : innerTiledResults->loops)
+    loopOps.push_back(loop);
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
 
@@ -178,7 +208,9 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   return success();
 }
 
-// Implementation of SConv::apply transform dialect operation.
+///
+/// Implementation of SConv::apply transform dialect operation.
+///
 DiagnosedSilenceableFailure
 transform::SConvOp::apply(transform::TransformRewriter &rewriter,
                           transform::TransformResults &results,
@@ -274,8 +306,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   CSA csa = createCSAPass(csaConv);
   CSAStrategy res = csa();
   
-  LogicalResult result =
-     applyTileTo(rewriter, getOperation(), genericOp, csa, res, results);
+  // Apply the tile in the genericOp based on the CSA Analysis
+  LogicalResult result = applyTileTo(rewriter, getOperation(), genericOp, csa, res, results);
 
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();

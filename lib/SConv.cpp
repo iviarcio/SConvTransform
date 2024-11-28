@@ -28,6 +28,7 @@
 #include "mlir/Dialect/Linalg/TransformOps/Syntax.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -41,6 +42,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
+#include <cstdint>
 
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/Interfaces/CallInterfaces.h"
@@ -126,6 +128,85 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
   return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
 }
 
+// Delinearizes the given composite `index` by the basis specified in `factors`.
+static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
+                                      ArrayRef<int64_t> factors) {
+  assert(!factors.empty() && "empty factor list");
+  SmallVector<Value> basis;
+  for (int64_t f : factors)
+    basis.push_back(b.create<arith::ConstantOp>(loc, b.getIndexAttr(f)));
+  FailureOr<SmallVector<Value>> multiIndex =
+      affine::delinearizeIndex(b, loc, index, basis);
+  assert(!failed(multiIndex) && "Failed to linearize img2col index");
+  return *multiIndex;
+}
+
+///
+/// Apply the input packing
+///
+static LogicalResult
+applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAStrategy res,
+                  SmallVector<Operation *> tiledOps, SmallVector<Operation *> loopOps) {
+
+  MLIRContext *context = rewriter.getContext();
+
+  // Get the inner generic convolution Operation
+  auto innerOp = tiledOps.front();
+  rewriter.setInsertionPoint(innerOp);
+  Location loc = innerOp->getLoc();
+
+  auto linalgOp = dyn_cast<linalg::GenericOp>(innerOp);
+  SmallVector<Value> inputs = linalgOp.getInputs();
+  Value input = inputs[0];
+  Value filter = inputs[1];
+
+  auto inputType = cast<ShapedType>(input.getType());
+  auto filterType = cast<ShapedType>(filter.getType());
+  auto inputShape = inputType.getShape();
+  auto filterShape = filterType.getShape();
+
+  // Compute the Packed Input Shape: n, ic × fh × fw, Nwin
+  // Example: n = 1, ic = 16, fh = 3, fw = 3, Nwin = 16
+  // Packed Input Shape: 1 × 144 × 16
+  int64_t n = inputShape[0];
+  int64_t ic = inputShape[1];
+  int64_t fh = filterShape[2];
+  int64_t fw = filterShape[3];
+  int64_t nw = csa.mK_.nwindows;
+  SmallVector<int64_t, 4> inputPackingShape = {n, ic * fh * fw, nw};
+  Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());
+
+  auto nloops = inputPackingShape.size();
+  auto parallel = utils::IteratorType::parallel;
+  SmallVector<utils::IteratorType, 3> packingIterators(nloops, parallel);
+  SmallVector<AffineMap, 4> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
+
+  auto packingTensor = rewriter.create<linalg::GenericOp>(
+    loc, inputPacking.getType(),
+    /*inputs=*/ValueRange{}, /*outputs=*/inputPacking, packingIndexingMaps,
+    packingIterators,
+    [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+      // Get the iterators
+      Value bIndex = nestedBuilder.create<linalg::IndexOp>(loc, 0);
+      Value kIndex = nestedBuilder.create<linalg::IndexOp>(loc, 1);
+      Value nIndex = nestedBuilder.create<linalg::IndexOp>(loc, 2);
+
+      // Recover the original iteration indices from the problem/input sizes.
+      SmallVector<Value> kIndices = unrollIndex(
+        nestedBuilder, nestedLoc, kIndex, ArrayRef<int64_t>{ic, fh, fw});
+      auto icIndex = kIndices[0];
+      auto fhIndex = kIndices[1];
+      auto fwIndex = kIndices[2];
+
+      SmallVector<Value> extractionIndices{bIndex, icIndex, fhIndex, fwIndex};
+      Value inputVal = nestedBuilder.create<tensor::ExtractOp>(
+        loc, input, extractionIndices);
+      nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
+    });
+
+  return success();
+}
+
 ///
 /// Apply a tiling transformation to a modified payload ops and store both the
 /// tiled operation as well as the created tile loops.
@@ -168,7 +249,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
 
-  // Now, perform the tiling in the inner convolution
+  // Perform the tiling in the inner convolution
   auto innerOp = tiledResults->tiledOps.front();
 
   SmallVector<int64_t, 6> innerTileSize = {0, csa.mK_.num_filters, csa.mK_.nwindows, 0, 0, 0};
@@ -200,6 +281,10 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
     loopOps.push_back(loop);
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
+
+  // Now, generate the input packing
+  LogicalResult result = applyInputPacking(rewriter, transformOp, csa, res, tiledOps, loopOps);
+
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))

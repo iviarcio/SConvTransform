@@ -204,6 +204,8 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
     });
 
+  tiledOps.push_back(packingTensor.getOperation());
+
   return success();
 }
 

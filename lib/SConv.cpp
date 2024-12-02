@@ -147,8 +147,8 @@ static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
 static LogicalResult
 promoteOps_InnerTile(RewriterBase &rewriter, Operation *transformOp, SmallVector<Operation *> loopOps) {
 
-  // Cast to scf::ForOp the  outermost loop of the second tile
   int i = 0;
+  // Cast to scf::ForOp the  outermost loop of the second tile
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[i]);
   if (!outerLoop) return transformOp->emitError("failed to get the outermost scf::for op");
 
@@ -223,11 +223,16 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
 
   MLIRContext *context = rewriter.getContext();
 
+  int i = 1;
+  // Cast to scf::ForOp the  innermost loop of the second tile
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[i]);
+  if (!innerLoop) return transformOp->emitError("failed to get the innermost scf::for op");
+  // Get the insertion point to the packing
+  rewriter.setInsertionPoint(innerLoop);
+  Location loc = innerLoop->getLoc();
+
   // Get the inner (generic) convolution Operation
   auto innerOp = tiledOps.front();
-  rewriter.setInsertionPoint(innerOp);
-  Location loc = innerOp->getLoc();
-
   // Cast to linalg::GenericOp to get the input & filter, types & shapes
   auto linalgOp = dyn_cast<linalg::GenericOp>(innerOp);
   SmallVector<Value> inputs = linalgOp.getInputs();
@@ -276,7 +281,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
     });
 
-  tiledOps.push_back(packingTensor.getOperation());
+  // tiledOps.push_back(packingTensor.getOperation());
 
   return success();
 }

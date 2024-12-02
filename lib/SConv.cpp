@@ -188,11 +188,30 @@ promoteOps_InnerTile(RewriterBase &rewriter, Operation *transformOp, SmallVector
   if (!affineApply1 || !affineApply2 || !tensorExtractSlice)
     return transformOp->emitError("Failed to get the inner ops");
 
- // Now, move the operations before the inner loop
+  // Set insertion point before the inner loop
   rewriter.setInsertionPoint(innerLoop);
-  rewriter.moveOpBefore(affineApply1, innerLoop);
-  rewriter.moveOpBefore(affineApply2, innerLoop);
-  rewriter.moveOpBefore(tensorExtractSlice, innerLoop);
+
+  // Clone operations to the outer loop before the inner loop
+  auto promotedAffineApply1 = rewriter.clone(*affineApply1);
+  auto promotedAffineApply2 = rewriter.clone(*affineApply2);
+  auto promotedTensorExtractSlice = rewriter.clone(*tensorExtractSlice);
+
+  // Replace uses of the old operations in the inner loop body
+  innerBody->walk([&](Operation *op) {
+    for (auto &operand : op->getOpOperands()) {
+      if (operand.get() == affineApply1->getResult(0))
+        operand.set(promotedAffineApply1->getResult(0));
+      else if (operand.get() == affineApply2->getResult(0))
+        operand.set(promotedAffineApply2->getResult(0));
+      else if (operand.get() == tensorExtractSlice->getResult(0))
+        operand.set(promotedTensorExtractSlice->getResult(0));
+    }
+  });
+
+  // Erase the old operations
+  if (affineApply1->use_empty()) rewriter.eraseOp(affineApply1);
+  if (affineApply2->use_empty()) rewriter.eraseOp(affineApply2);
+  if (tensorExtractSlice->use_empty()) rewriter.eraseOp(tensorExtractSlice);
 
   return success();
 }
@@ -209,6 +228,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
   rewriter.setInsertionPoint(innerOp);
   Location loc = innerOp->getLoc();
 
+  // Cast to linalg::GenericOp to get the input & filter, types & shapes
   auto linalgOp = dyn_cast<linalg::GenericOp>(innerOp);
   SmallVector<Value> inputs = linalgOp.getInputs();
   Value input = inputs[0];
@@ -220,8 +240,6 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
   auto filterShape = filterType.getShape();
 
   // Compute the Packed Input Shape: n, ic × fh × fw, Nwin
-  // Example: n = 1, ic = 16, fh = 3, fw = 3, Nwin = 16
-  // Packed Input Shape: 1 × 144 × 16
   int64_t n = inputShape[0];
   int64_t ic = inputShape[1];
   int64_t fh = filterShape[2];

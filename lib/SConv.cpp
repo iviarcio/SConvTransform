@@ -48,6 +48,7 @@
 #include "mlir/Interfaces/CallInterfaces.h"
 
 using namespace mlir;
+using namespace mlir::affine;
 using namespace mlir::linalg;
 using namespace mlir::transform;
 
@@ -141,16 +142,69 @@ static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
   return *multiIndex;
 }
 
-///
-/// Apply the input packing
-///
+// After the inner tile operation, the two affine.apply and the first extracted slice into
+// the internal loop must be promoted to the outer one.
+static LogicalResult
+promoteOps_InnerTile(RewriterBase &rewriter, Operation *transformOp, SmallVector<Operation *> loopOps) {
+
+  // Cast to scf::ForOp the  outermost loop of the second tile
+  int i = 0;
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[i]);
+  if (!outerLoop) return transformOp->emitError("failed to get the outermost scf::for op");
+
+  // Get the body of the outer loop
+  Block *outerBody = outerLoop.getBody();
+
+  // Locate the inner loop within the outer loop's body
+  scf::ForOp innerLoop;
+  for (Operation &op : outerBody->getOperations()) {
+    if (auto loop = dyn_cast<scf::ForOp>(&op)) {
+      innerLoop = loop;
+      break;
+    }
+  }
+  if (!innerLoop) return transformOp->emitError("failed to get the innermost scf::for op");
+
+  // Get the body of the inner loop
+  Block *innerBody = innerLoop.getBody();
+
+  // Locate the target operations within the inner loop body
+  Operation *affineApply1 = nullptr, *affineApply2 = nullptr;
+  Operation *tensorExtractSlice = nullptr;
+
+  for (Operation &op : innerBody->getOperations()) {
+    if (!affineApply1 && isa<AffineApplyOp>(&op))
+      affineApply1 = &op;
+    else if (!affineApply2 && isa<AffineApplyOp>(&op))
+      affineApply2 = &op;
+    else if (!tensorExtractSlice && isa<tensor::ExtractSliceOp>(&op))
+      tensorExtractSlice = &op;
+
+    // Stop once all target operations are found
+    if (affineApply1 && affineApply2 && tensorExtractSlice)
+      break;
+  }
+
+  if (!affineApply1 || !affineApply2 || !tensorExtractSlice)
+    return transformOp->emitError("Failed to get the inner ops");
+
+ // Now, move the operations before the inner loop
+  rewriter.setInsertionPoint(innerLoop);
+  rewriter.moveOpBefore(affineApply1, innerLoop);
+  rewriter.moveOpBefore(affineApply2, innerLoop);
+  rewriter.moveOpBefore(tensorExtractSlice, innerLoop);
+
+  return success();
+}
+
+// Apply the input packing. This packing will be inserted before the inner convolution op
 static LogicalResult
 applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAStrategy res,
                   SmallVector<Operation *> tiledOps, SmallVector<Operation *> loopOps) {
 
   MLIRContext *context = rewriter.getContext();
 
-  // Get the inner generic convolution Operation
+  // Get the inner (generic) convolution Operation
   auto innerOp = tiledOps.front();
   rewriter.setInsertionPoint(innerOp);
   Location loc = innerOp->getLoc();
@@ -209,10 +263,8 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
   return success();
 }
 
-///
-/// Apply a tiling transformation to a modified payload ops and store both the
-/// tiled operation as well as the created tile loops.
-///
+// Apply a tiling transformation to a modified payload ops and store both the
+// tiled operation as well as the created tile loops.
 static LogicalResult
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
             CSA csa, CSAStrategy res, transform::TransformResults &transformResults) {
@@ -246,7 +298,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   FailureOr<scf::SCFTilingResult> tiledResults =
       scf::tileUsingSCF(rewriter, tilingInterfaceOp, tilingOptions);
   if (failed(tiledResults))
-    return failure();
+    return transformOp->emitError("failed the outermost tile operation");
 
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
@@ -272,7 +324,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   FailureOr<scf::SCFTilingResult> innerTiledResults =
       scf::tileUsingSCF(rewriter, innerTilingInterfaceOp, innerTilingOptions);
   if (failed(innerTiledResults))
-    return failure();
+    return transformOp->emitError("failed the innermost tile operation");
 
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(innerTilingInterfaceOp, innerTiledResults->replacements);
@@ -284,9 +336,14 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
 
-  // Now, generate the input packing
-  LogicalResult result = applyInputPacking(rewriter, transformOp, csa, res, tiledOps, loopOps);
+  // First, the two affine.apply and the first extracted slice into the inner loop
+  // of the second tile must be promoted to the outer loop
+  LogicalResult result1 = promoteOps_InnerTile(rewriter, transformOp, loopOps);
+  if (failed(result1)) return transformOp->emitError("failed to promote inner loop ops");
 
+  // Now, generate the input packing
+  LogicalResult result2 = applyInputPacking(rewriter, transformOp, csa, res, tiledOps, loopOps);
+  if (failed(result2)) return transformOp->emitError("failed to apply the input packing");
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))

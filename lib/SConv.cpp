@@ -223,7 +223,7 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAS
   MLIRContext *context = rewriter.getContext();
 
   // select the loop based on IS or WS
-  int loopIndex = res.schd == IS ? 0 : 1;
+  int loopIndex = res.schd == IS ? 1 : 0;
   // Cast to scf::ForOp the  selected loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
   if (!loopOp) return transformOp->emitError("failed to get the inner scf::for op");
@@ -267,16 +267,13 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAS
     packingIterators,
     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
       // Get the iterators
-      Value bIndex = nestedBuilder.create<linalg::IndexOp>(loc, 0);
-      Value kIndex = nestedBuilder.create<linalg::IndexOp>(loc, 1);
-
-      // Recover the original iteration indices from the problem/input sizes.
+      Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0);
+      Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1);
       SmallVector<Value> kIndices = unrollIndex(
-        nestedBuilder, nestedLoc, kIndex, ArrayRef<int64_t>{fh, fw});
+        nestedBuilder, nestedLoc, index0, ArrayRef<int64_t>{fh, fw});
       auto fhIndex = kIndices[0];
       auto fwIndex = kIndices[1];
-
-      SmallVector<Value> extractionIndices{bIndex, fhIndex, fwIndex};
+      SmallVector<Value> extractionIndices{index1, fhIndex, fwIndex};
       Value filterVal = nestedBuilder.create<tensor::ExtractOp>(
         loc, filter, extractionIndices);
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, filterVal);
@@ -294,7 +291,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
   MLIRContext *context = rewriter.getContext();
 
   // select the loop based on IS or WS
-  int loopIndex = res.schd == IS ? 1 : 0;
+  int loopIndex = res.schd == IS ? 0 : 1;
   // Cast to scf::ForOp the  selected loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
   if (!loopOp) return transformOp->emitError("failed to get the inner scf::for op");
@@ -339,18 +336,14 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
     packingIterators,
     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
       // Get the iterators
-      Value bIndex = nestedBuilder.create<linalg::IndexOp>(loc, 0);
-      Value kIndex = nestedBuilder.create<linalg::IndexOp>(loc, 1);
-      Value nIndex = nestedBuilder.create<linalg::IndexOp>(loc, 2);
-
-      // Recover the original iteration indices from the problem/input sizes.
+      Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0);
+      Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1);
+      Value index2 = nestedBuilder.create<linalg::IndexOp>(loc, 2);
       SmallVector<Value> kIndices = unrollIndex(
-        nestedBuilder, nestedLoc, kIndex, ArrayRef<int64_t>{ic, fh, fw});
-      auto icIndex = kIndices[0];
-      auto fhIndex = kIndices[1];
-      auto fwIndex = kIndices[2];
-
-      SmallVector<Value> extractionIndices{bIndex, icIndex, fhIndex, fwIndex};
+        nestedBuilder, nestedLoc, index1, ArrayRef<int64_t>{fh, fw});
+      auto fhIndex = kIndices[0];
+      auto fwIndex = kIndices[1];
+      SmallVector<Value> extractionIndices{index0, fhIndex, fwIndex};
       Value inputVal = nestedBuilder.create<tensor::ExtractOp>(
         loc, input, extractionIndices);
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
@@ -545,6 +538,10 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   CSA csa = createCSAPass(csaConv);
   CSAStrategy res = csa();
   
+  /* Just for test */
+  res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
+  /* Comment the code above to use the CSA Analysis */
+
   // Apply the tile in the genericOp based on the CSA Analysis
   LogicalResult result = applyTileTo(rewriter, getOperation(), genericOp, csa, res, results);
 

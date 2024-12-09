@@ -143,7 +143,7 @@ protected:
   // CSA heuristic
   uint32_t (Strategies::*heuristic)(
       uint32_t, uint32_t (Strategies::*)(uint32_t),
-      uint32_t) = &Strategies::binarySearchHeuristic;
+      uint32_t) = &Strategies::halfHeuristic;
 
 public:
   // memory accesses

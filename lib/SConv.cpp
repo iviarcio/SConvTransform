@@ -142,77 +142,16 @@ static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
   return *multiIndex;
 }
 
-// static LogicalResult
-// promoteOps_InnerTile(RewriterBase &rewriter, Operation *transformOp, SmallVector<Operation *> loopOps) {
-//
-//   int i = 0;
-//   // Cast to scf::ForOp the  outermost loop of the second tile
-//   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[i]);
-//   if (!outerLoop) return transformOp->emitError("failed to get the outermost scf::for op");
-//
-//   // Get the body of the outer loop
-//   Block *outerBody = outerLoop.getBody();
-//
-//   // Locate the inner loop within the outer loop's body
-//   scf::ForOp innerLoop;
-//   for (Operation &op : outerBody->getOperations()) {
-//     if (auto loop = dyn_cast<scf::ForOp>(&op)) {
-//       innerLoop = loop;
-//       break;
-//     }
-//   }
-//   if (!innerLoop) return transformOp->emitError("failed to get the innermost scf::for op");
-//
-//   // Get the body of the inner loop
-//   Block *innerBody = innerLoop.getBody();
-//
-//   // Locate the target operations within the inner loop body
-//   Operation *affineApply1 = nullptr, *affineApply2 = nullptr;
-//   Operation *tensorExtractSlice = nullptr;
-//
-//   for (Operation &op : innerBody->getOperations()) {
-//     if (!affineApply1 && isa<AffineApplyOp>(&op))
-//       affineApply1 = &op;
-//     else if (!affineApply2 && isa<AffineApplyOp>(&op))
-//       affineApply2 = &op;
-//     else if (!tensorExtractSlice && isa<tensor::ExtractSliceOp>(&op))
-//       tensorExtractSlice = &op;
-//
-//     // Stop once all target operations are found
-//     if (affineApply1 && affineApply2 && tensorExtractSlice)
-//       break;
-//   }
-//
-//   if (!affineApply1 || !affineApply2 || !tensorExtractSlice)
-//     return transformOp->emitError("Failed to get the inner ops");
-//
-//   // Set insertion point before the inner loop
-//   rewriter.setInsertionPoint(innerLoop);
-//
-//   // Clone operations to the outer loop before the inner loop
-//   auto promotedAffineApply1 = rewriter.clone(*affineApply1);
-//   auto promotedAffineApply2 = rewriter.clone(*affineApply2);
-//   auto promotedTensorExtractSlice = rewriter.clone(*tensorExtractSlice);
-//
-//   // Replace uses of the old operations in the inner loop body
-//   innerBody->walk([&](Operation *op) {
-//     for (auto &operand : op->getOpOperands()) {
-//       if (operand.get() == affineApply1->getResult(0))
-//         operand.set(promotedAffineApply1->getResult(0));
-//       else if (operand.get() == affineApply2->getResult(0))
-//         operand.set(promotedAffineApply2->getResult(0));
-//       else if (operand.get() == tensorExtractSlice->getResult(0))
-//         operand.set(promotedTensorExtractSlice->getResult(0));
-//     }
-//   });
-//
-//   // Erase the old operations
-//   if (affineApply1->use_empty()) rewriter.eraseOp(affineApply1);
-//   if (affineApply2->use_empty()) rewriter.eraseOp(affineApply2);
-//   if (tensorExtractSlice->use_empty()) rewriter.eraseOp(tensorExtractSlice);
-//
-//   return success();
-// }
+// Given indices corresponding to iterators in the output (oIndex) and filter
+// (fIndex) for a convolution, compute the convolved index for the
+// input as `oIndex * stride + fIndex`.
+static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
+                               Value fIndex, int64_t stride) {
+  AffineExpr oExpr, fExpr;
+  bindSymbols(b.getContext(), oExpr, fExpr);
+  AffineMap convMap = AffineMap::get(0, 2, stride * oExpr + fExpr);
+  return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
+}
 
 // Apply the filter packing. This packing will be inserted at the begining of first or
 // second loop level of the internal convolution depends of Input or Wheight Stationary
@@ -263,19 +202,29 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAS
 
   auto packingTensor = rewriter.create<linalg::GenericOp>(
     loc, filterPacking.getType(),
-    /*inputs=*/ValueRange{}, /*outputs=*/filterPacking, packingIndexingMaps,
-    packingIterators,
+    /*inputs=*/ValueRange{},
+    /*outputs=*/filterPacking,
+    /*indeexingMaps=*/ packingIndexingMaps,
+    /*iteratorTypes=*/ packingIterators,
     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
       // Get the iterators
-      Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0);
-      Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1);
-      SmallVector<Value> kIndices = unrollIndex(
-        nestedBuilder, nestedLoc, index0, ArrayRef<int64_t>{fh, fw});
-      auto fhIndex = kIndices[0];
-      auto fwIndex = kIndices[1];
-      SmallVector<Value> extractionIndices{index1, fhIndex, fwIndex};
-      Value filterVal = nestedBuilder.create<tensor::ExtractOp>(
-        loc, filter, extractionIndices);
+      Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0); // ic × fh × fw
+      Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1); // nf
+
+      // Unroll index0 into {ic, fh, fw}
+      SmallVector<Value> unpackedIndices = unrollIndex(
+          nestedBuilder, nestedLoc, index0, ArrayRef<int64_t>{ic, fh, fw});
+      Value icIndex = unpackedIndices[0];
+      Value fhIndex = unpackedIndices[1];
+      Value fwIndex = unpackedIndices[2];
+
+      // Create the extraction indices for the original filter tensor
+      SmallVector<Value> extractionIndices{index1, icIndex, fhIndex, fwIndex};
+
+      // Extract the value from the original filter tensor
+      Value filterVal = nestedBuilder.create<tensor::ExtractOp>(loc, filter, extractionIndices);
+
+      // Yield the extracted value into the packed tensor
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, filterVal);
     });
 
@@ -285,7 +234,8 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAS
 // Apply the input packing. This packing will be inserted at the begining of first or
 // second loop level of the internal convolution depends of Input or Wheight Stationary
 static LogicalResult
-applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAStrategy res,
+applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
+                  CSAStrategy res, SmallVector<int64_t, 2> strides,
                   SmallVector<Operation *> tiledOps, SmallVector<Operation *> loopOps) {
 
   MLIRContext *context = rewriter.getContext();
@@ -308,20 +258,29 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
   if (!linalgOp) return transformOp->emitError("failed to get the inner convOp");
 
   SmallVector<Value> inputs = linalgOp.getInputs();
+  SmallVector<Value> outputs = linalgOp.getOutputs();
   Value input = inputs[0];
   Value filter = inputs[1];
+  Value output = outputs[0];
 
   auto inputType = cast<ShapedType>(input.getType());
-  auto filterType = cast<ShapedType>(filter.getType());
   auto inputShape = inputType.getShape();
+
+  auto filterType = cast<ShapedType>(filter.getType());
   auto filterShape = filterType.getShape();
 
-  // Compute the Packed Input Shape: {n, ic × fh × fw, nw}
+  auto outputType = cast<ShapedType>(output.getType());
+  auto outputShape = outputType.getShape();
+
   int64_t n = inputShape[0];
   int64_t ic = inputShape[1];
   int64_t fh = filterShape[2];
   int64_t fw = filterShape[3];
+  int64_t oh = outputShape[1];
+  int64_t ow = outputShape[2];
   int64_t nw = csa.mK_.nwindows;
+
+  // Compute the Packed Input Shape: {n, ic × fh × fw, nw}
   SmallVector<int64_t, 3> inputPackingShape = {n, ic * fh * fw, nw};
   Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());
 
@@ -334,18 +293,37 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
     loc, inputPacking.getType(),
     /*inputs=*/ValueRange{}, /*outputs=*/inputPacking, packingIndexingMaps,
     packingIterators,
+
     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
       // Get the iterators
-      Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0);
-      Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1);
-      Value index2 = nestedBuilder.create<linalg::IndexOp>(loc, 2);
-      SmallVector<Value> kIndices = unrollIndex(
-        nestedBuilder, nestedLoc, index1, ArrayRef<int64_t>{fh, fw});
-      auto fhIndex = kIndices[0];
-      auto fwIndex = kIndices[1];
-      SmallVector<Value> extractionIndices{index0, fhIndex, fwIndex};
-      Value inputVal = nestedBuilder.create<tensor::ExtractOp>(
-        loc, input, extractionIndices);
+      Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0); // n
+      Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1); // ic × fh × fw
+      Value index2 = nestedBuilder.create<linalg::IndexOp>(loc, 2); // nw 
+
+      // Unroll index1 into {ic, fh, fw}
+      SmallVector<Value> unpackedSpatialIndices = unrollIndex(
+          nestedBuilder, nestedLoc, index1, ArrayRef<int64_t>{ic, fh, fw});
+      Value icIndex = unpackedSpatialIndices[0];
+      Value fhIndex = unpackedSpatialIndices[1];
+      Value fwIndex = unpackedSpatialIndices[2];
+
+      // Unroll index2 into {oh, ow}
+      SmallVector<Value> unpackedWindowIndices = unrollIndex(
+          nestedBuilder, nestedLoc, index2, ArrayRef<int64_t>{oh, ow});
+      Value ohIndex = unpackedWindowIndices[0];
+      Value owIndex = unpackedWindowIndices[1];
+
+      // Compute the actual spatial indices using strides
+      Value hIndex = getConvolvedIndex(nestedBuilder, nestedLoc, ohIndex, fhIndex, strides[0]);
+      Value wIndex = getConvolvedIndex(nestedBuilder, nestedLoc, owIndex, fwIndex, strides[1]);
+
+      // Create the extraction indices for the original input tensor
+      SmallVector<Value> extractionIndices{index0, icIndex, hIndex, wIndex};
+
+      // Extract the value from the original input tensor
+      Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, input, extractionIndices);
+
+      // Yield the extracted value into the packed tensor
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
     });
 
@@ -356,7 +334,8 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSASt
 // tiled operation as well as the created tile loops.
 static LogicalResult
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
-            CSA csa, CSAStrategy res, transform::TransformResults &transformResults) {
+            CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, 
+            transform::TransformResults &transformResults) {
 
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> loopOps;
@@ -430,7 +409,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   if (failed(result1)) return transformOp->emitError("failed to apply the filter packing");
 
   // Generate the input packing
-  LogicalResult result2 = applyInputPacking(rewriter, transformOp, csa, res, tiledOps, loopOps);
+  LogicalResult result2 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
   if (failed(result2)) return transformOp->emitError("failed to apply the input packing");
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
@@ -506,6 +485,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   // Get strides
   auto hstride = convOp.getStrides().getValues<int64_t>()[0];
   auto wstride = convOp.getStrides().getValues<int64_t>()[1];
+  SmallVector<int64_t, 2> strides = {hstride, wstride};
 
   AffineExpr d0, d1, d2, d3, d4, d5;
   bindDims(context, d0, d1, d2, d3, d4, d5);
@@ -543,7 +523,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   /* Comment the code above to use the CSA Analysis */
 
   // Apply the tile in the genericOp based on the CSA Analysis
-  LogicalResult result = applyTileTo(rewriter, getOperation(), genericOp, csa, res, results);
+  LogicalResult result = applyTileTo(rewriter, getOperation(), genericOp, csa, res, strides, results);
 
   return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
                         : DiagnosedSilenceableFailure::success();

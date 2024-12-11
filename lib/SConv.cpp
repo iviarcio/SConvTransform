@@ -138,7 +138,7 @@ static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
     basis.push_back(b.create<arith::ConstantOp>(loc, b.getIndexAttr(f)));
   FailureOr<SmallVector<Value>> multiIndex =
       affine::delinearizeIndex(b, loc, index, basis);
-  assert(!failed(multiIndex) && "Failed to linearize img2col index");
+  assert(!failed(multiIndex) && "Failed to linearize sconv index");
   return *multiIndex;
 }
 
@@ -153,6 +153,98 @@ static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
   return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
 }
 
+// After the inner tile operation, promote the two affine.apply and the first extracted
+// slice if chd = IS or the second extracted slice if schd = WS, to the outer loop
+static LogicalResult
+promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
+                 CSAStrategy res, SmallVector<Operation *> loopOps) {
+
+  // Cast to scf::ForOp the  outermost loop of the second tile
+  int i = 0;
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[i]);
+  if (!outerLoop) return transformOp->emitError("failed to get the outermost scf::for op");
+
+  // Get the body of the outer loop
+  Block *outerBody = outerLoop.getBody();
+
+  // Locate the inner loop within the outer loop's body
+  scf::ForOp innerLoop;
+  for (Operation &op : outerBody->getOperations()) {
+    if (auto loop = dyn_cast<scf::ForOp>(&op)) {
+      innerLoop = loop;
+      break;
+    }
+  }
+  if (!innerLoop) return transformOp->emitError("failed to get the inner forOp");
+
+  // Get the body of the inner loop
+  Block *innerBody = innerLoop.getBody();
+
+  Operation *affineApply1 = nullptr;
+  Operation *affineApply2 = nullptr;
+  Operation *tensorExtractSlice1 = nullptr;
+  Operation *tensorExtractSlice2 = nullptr;
+
+  // Locate the target operations within the inner loop body
+  for (Operation &op : innerBody->getOperations()) {
+    if (!affineApply1 && isa<AffineApplyOp>(&op))
+      affineApply1 = &op;
+    else if (!affineApply2 && isa<AffineApplyOp>(&op))
+      affineApply2 = &op;
+    else if (!tensorExtractSlice1 && isa<tensor::ExtractSliceOp>(&op))
+      tensorExtractSlice1 = &op;
+    else if (!tensorExtractSlice2 && isa<tensor::ExtractSliceOp>(&op))
+      tensorExtractSlice2 = &op;
+
+    // Stop once all target operations are found
+    if (affineApply1 && affineApply2 && tensorExtractSlice1 && tensorExtractSlice2)
+      break;
+  }
+
+  if (!affineApply1 || !affineApply2 || !tensorExtractSlice1 || !tensorExtractSlice2)
+    return transformOp->emitError("Failed to hosting Ops");
+
+  // Set insertion point at the start of outer loop
+  rewriter.setInsertionPointToStart(outerBody);
+
+  Operation *promotedAffineApply1 = nullptr;
+  Operation *promotedAffineApply2 = nullptr;
+  Operation *promotedTensorExtractSlice1 = nullptr;
+  Operation *promotedTensorExtractSlice2 = nullptr;
+
+  // Clone operations to the outer loop
+  if (res.schd == IS) {
+    promotedAffineApply1 = rewriter.clone(*affineApply1);
+    promotedAffineApply2 = rewriter.clone(*affineApply2);
+    promotedTensorExtractSlice1 = rewriter.clone(*tensorExtractSlice1);
+  }
+  else {
+    promotedTensorExtractSlice2 = rewriter.clone(*tensorExtractSlice2);
+  }
+
+  // Replace uses of the old operations in the inner loop body
+  innerBody->walk([&](Operation *op) {
+    for (auto &operand : op->getOpOperands()) {
+      if (res.schd == IS && operand.get() == affineApply1->getResult(0))
+        operand.set(promotedAffineApply1->getResult(0));
+      else if (res.schd == IS && operand.get() == affineApply2->getResult(0))
+        operand.set(promotedAffineApply2->getResult(0));
+      else if (res.schd == IS && operand.get() == tensorExtractSlice1->getResult(0))
+        operand.set(promotedTensorExtractSlice1->getResult(0));
+      else if (res.schd == WS && operand.get() == tensorExtractSlice2->getResult(0))
+        operand.set(promotedTensorExtractSlice2->getResult(0));
+    }
+  });
+
+  // Erase the old operations
+  if (affineApply1->use_empty()) rewriter.eraseOp(affineApply1);
+  if (affineApply2->use_empty()) rewriter.eraseOp(affineApply2);
+  if (tensorExtractSlice1->use_empty()) rewriter.eraseOp(tensorExtractSlice1);
+  if (tensorExtractSlice2->use_empty()) rewriter.eraseOp(tensorExtractSlice2);
+
+  return success();
+}
+
 // Apply the filter packing. This packing will be inserted at the begining of first or
 // second loop level of the internal convolution depends of Input or Wheight Stationary
 static LogicalResult
@@ -163,20 +255,36 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAS
 
   // select the loop based on IS or WS
   int loopIndex = res.schd == IS ? 1 : 0;
+
   // Cast to scf::ForOp the  selected loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
   if (!loopOp) return transformOp->emitError("failed to get the inner scf::for op");
-
-  // Get the insertion point to the packing
   Block *loopBody = loopOp.getBody();
-  rewriter.setInsertionPointToStart(loopBody);
-  Location loc = loopOp->getLoc();
 
   // Get the inner (generic) convOp
   auto convOp = tiledOps.front();
+
   // Cast to linalg::GenericOp to get the input & filter, types & shapes
   auto linalgOp = dyn_cast<linalg::GenericOp>(convOp);
   if (!linalgOp) return transformOp->emitError("failed to get the inner convOp");
+
+  // Locate the insertion point (scf::for Op if WS or linalg::generic Op if IS)
+  Location loc = linalgOp.getLoc(); // location should never be null.
+  if (res.schd == WS) {
+    scf::ForOp innerLoop;
+    for (Operation &op : loopBody->getOperations()) {
+      if (auto loop = dyn_cast<scf::ForOp>(&op)) {
+        innerLoop = loop;
+        break;
+      }
+    }
+    if (!innerLoop) return transformOp->emitError("failed to get the inner forOp");
+    rewriter.setInsertionPoint(innerLoop);
+    loc = innerLoop->getLoc();
+  }
+  else {
+    rewriter.setInsertionPoint(linalgOp);
+  }
 
   SmallVector<Value> inputs = linalgOp.getInputs();
   Value input = inputs[0];
@@ -242,20 +350,36 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
 
   // select the loop based on IS or WS
   int loopIndex = res.schd == IS ? 0 : 1;
+
   // Cast to scf::ForOp the  selected loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
   if (!loopOp) return transformOp->emitError("failed to get the inner scf::for op");
-
-  // Get the insertion point to the packing
   Block *loopBody = loopOp.getBody();
-  rewriter.setInsertionPointToStart(loopBody);
-  Location loc = loopOp->getLoc();
 
   // Get the inner (generic) convOp
   auto convOp = tiledOps.front();
+
   // Cast to linalg::GenericOp to get the input & filter, types & shapes
   auto linalgOp = dyn_cast<linalg::GenericOp>(convOp);
   if (!linalgOp) return transformOp->emitError("failed to get the inner convOp");
+
+  // Locate the insertion point (scf::for Op if IS or linalg::generic Op if WS)
+  Location loc = linalgOp.getLoc(); // location should never be null.
+  if (res.schd == IS) {
+    scf::ForOp innerLoop;
+    for (Operation &op : loopBody->getOperations()) {
+      if (auto loop = dyn_cast<scf::ForOp>(&op)) {
+        innerLoop = loop;
+        break;
+      }
+    }
+    if (!innerLoop) return transformOp->emitError("failed to get the inner forOp");
+    rewriter.setInsertionPoint(innerLoop);
+    loc = innerLoop->getLoc();
+  }
+  else {
+    rewriter.setInsertionPoint(linalgOp);
+  }
 
   SmallVector<Value> inputs = linalgOp.getInputs();
   SmallVector<Value> outputs = linalgOp.getOutputs();
@@ -307,18 +431,11 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
       Value fhIndex = unpackedSpatialIndices[1];
       Value fwIndex = unpackedSpatialIndices[2];
 
-      // Unroll index2 into {oh, ow}
-      SmallVector<Value> unpackedWindowIndices = unrollIndex(
-          nestedBuilder, nestedLoc, index2, ArrayRef<int64_t>{oh, ow});
-      Value ohIndex = unpackedWindowIndices[0];
-      Value owIndex = unpackedWindowIndices[1];
-
       // Compute the actual spatial indices using strides
-      Value hIndex = getConvolvedIndex(nestedBuilder, nestedLoc, ohIndex, fhIndex, strides[0]);
-      Value wIndex = getConvolvedIndex(nestedBuilder, nestedLoc, owIndex, fwIndex, strides[1]);
+      Value wIndex = getConvolvedIndex(nestedBuilder, nestedLoc, index2, fwIndex, strides[1]);
 
       // Create the extraction indices for the original input tensor
-      SmallVector<Value> extractionIndices{index0, icIndex, hIndex, wIndex};
+      SmallVector<Value> extractionIndices{index0, icIndex, fhIndex, wIndex};
 
       // Extract the value from the original input tensor
       Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, input, extractionIndices);
@@ -345,7 +462,8 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
     return transformOp->emitError("only TilingInterface ops are supported");
 
   // Assign tile sizes
-  // N, NF * K2/3, NWIN * K3/2, NC, FH, FW
+  // Input Stationary: N, NF * K2, NWIN * K3, NC, FH, FW  
+  // Weight Stationary: N, NF * K3, NWIN * K2, NC, FH, FW  
   int64_t nFTiles = csa.mK_.num_filters * (res.schd == IS ? res.k2 : res.k3);
   int64_t nWinTiles = csa.mK_.nwindows * (res.schd == IS ? res.k3 : res.k2);
   SmallVector<int64_t, 6> tileSize = {1, nFTiles, nWinTiles, res.tile_c, 0, 0};
@@ -403,6 +521,10 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
     loopOps.push_back(loop);
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
+
+  // Promote some inner loop Ops depends of schedule (WS or IS)
+  LogicalResult result0 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
+  if (failed(result0)) return transformOp->emitError("failed to hosting Ops");
 
   // Generate the filter packing
   LogicalResult result1 = applyFilterPacking(rewriter, transformOp, csa, res, tiledOps, loopOps);

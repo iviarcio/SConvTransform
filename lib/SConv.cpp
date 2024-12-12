@@ -143,13 +143,18 @@ static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
 }
 
 // Given indices corresponding to iterators in the output (oIndex) and filter
-// (fIndex) for a convolution, compute the convolved index for the
-// input as `oIndex * stride + fIndex`.
+// (fIndex) for a convolution, compute the convolved index for the input as
+// `oIndex * stride + fIndex`.
 static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
                                Value fIndex, int64_t stride) {
-  AffineExpr oExpr, fExpr;
-  bindSymbols(b.getContext(), oExpr, fExpr);
-  AffineMap convMap = AffineMap::get(0, 2, stride * oExpr + fExpr);
+  AffineExpr oExpr, fExpr, strideExpr;
+  bindDims(b.getContext(), oExpr, fExpr);
+  strideExpr = b.getAffineConstantExpr(stride);
+  
+  // Create the affine map with both indices as inputs.
+  AffineMap convMap = AffineMap::get(2, 0, oExpr * strideExpr + fExpr, b.getContext());
+  
+  // Apply the affine map to the provided indices.
   return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
 }
 

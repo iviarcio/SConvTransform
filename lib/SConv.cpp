@@ -219,8 +219,14 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
 
   // Clone operations to the outer loop
   if (res.schd == IS) {
-    promotedAffineApply1 = rewriter.clone(*affineApply1);
-    promotedAffineApply2 = rewriter.clone(*affineApply2);
+    SmallVector<Value, 1> outIndVar1 = {outerLoop.getInductionVar()};
+    promotedAffineApply1 = rewriter.create<AffineApplyOp>(
+      affineApply1->getLoc(), affineApply1->getAttrOfType<AffineMapAttr>("map"), outIndVar1);
+
+    SmallVector<Value, 1> outIndVar2 = {outerLoop.getInductionVar()};
+    promotedAffineApply2 = rewriter.create<AffineApplyOp>(
+      affineApply2->getLoc(), affineApply2->getAttrOfType<AffineMapAttr>("map"), outIndVar2);
+
     promotedTensorExtractSlice1 = rewriter.clone(*tensorExtractSlice1);
   }
   else {

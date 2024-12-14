@@ -227,8 +227,8 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
     promotedTensorExtractSlice2 = rewriter.clone(*tensorExtractSlice2);
   }
 
-  // Replace uses of the old operations in the inner loop body
-  innerBody->walk([&](Operation *op) {
+  // Replace uses of the old operations starting at the outer loop body
+  outerBody->walk([&](Operation *op) {
     for (auto &operand : op->getOpOperands()) {
       if (res.schd == IS && operand.get() == affineApply1->getResult(0))
         operand.set(promotedAffineApply1->getResult(0));
@@ -646,7 +646,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   CSAStrategy res = csa();
   
   /* Just for test */
-  res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
+  /* res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16; */
+  res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
   /* Comment the code above to use the CSA Analysis */
 
   // Apply the tile in the genericOp based on the CSA Analysis

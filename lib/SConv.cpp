@@ -158,6 +158,98 @@ static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
   return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
 }
 
+// After the packing operations, the linalOps (innermost conv) must be fixed to 
+// get the packed input & filter. Also, fix the iteraor types & maps.
+static LogicalResult
+adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
+                SmallVector<Operation *> tiledOps, SmallVector<Operation *> loopOps) {
+
+  // Get context
+  MLIRContext *context = rewriter.getContext();
+
+  // get the outer loop
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  if (!outerLoop) return transformOp->emitError("failed to get the outermost scf::for op");
+
+  // Get the body of the outer loop
+  Block *outerBody = outerLoop.getBody();
+
+  // Locate the inner loop within the outer loop's body
+  scf::ForOp innerLoop;
+  for (Operation &op : outerBody->getOperations()) {
+    if (auto loop = dyn_cast<scf::ForOp>(&op)) {
+      innerLoop = loop;
+      break;
+    }
+  }
+  if (!innerLoop) return transformOp->emitError("failed to get the inner forOp");
+
+  // Get the body of the inner loop
+  Block *innerBody = innerLoop.getBody();
+
+  // Get the inner (generic) convOp
+  auto convOp = tiledOps.front();
+  Location loc = convOp->getLoc();
+
+  // Cast to linalg::GenericOp
+  auto linalgOp = dyn_cast<linalg::GenericOp>(convOp);
+  if (!linalgOp) return transformOp->emitError("failed to get the inner convOp");
+
+  // get input & filter based on the schedule
+  linalg::GenericOp outPackOp;
+  for (Operation &op : outerBody->getOperations()) {
+    if (auto packOp = dyn_cast<linalg::GenericOp>(&op)) {
+      outPackOp = packOp;
+      break;
+    }
+  }
+  linalg::GenericOp innPackOp;
+  for (Operation &op : innerBody->getOperations()) {
+    if (auto packOp = dyn_cast<linalg::GenericOp>(&op)) {
+      innPackOp = packOp;
+      break;
+    }
+  }
+
+  Value input = res.schd == IS ? outPackOp.getResult(0) : innPackOp.getResult(0); 
+  Value filter = res.schd == WS ? outPackOp.getResult(0) : innPackOp.getResult(0); 
+
+  auto inputType = cast<ShapedType>(input.getType());
+  auto filterType = cast<ShapedType>(filter.getType());
+
+  // Create the new iterator types
+  auto parallel = utils::IteratorType::parallel;
+  auto reduction = utils::IteratorType::reduction;
+  SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction};
+
+  // Create the new maps
+  AffineExpr d0, d1, d2, d3;
+  bindDims(context, d0, d1, d2, d3);
+  auto lhsMap = AffineMap::get(4, 0, {d0, d3, d2}, context);
+  auto rhsMap = AffineMap::get(4, 0, {d3, d1}, context);
+  auto resultMap = AffineMap::get(4, 0, {d0, d1, d2}, context);
+
+  // set the insertion point
+  rewriter.setInsertionPoint(linalgOp);
+
+  // replace the convOp
+  auto genericOp = rewriter.create<linalg::GenericOp>(
+    loc,
+    linalgOp.getOutputs()[0].getType(),
+    ValueRange{input, filter},
+    linalgOp.getOutputs(),
+    ArrayRef<AffineMap>{lhsMap, rhsMap, resultMap},
+    newOpIterators, 
+    [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+      Value mul = createMul(loc, args[0], args[1], args[2].getType(), nestedBuilder);
+      Value add = createAdd(loc, mul, args[2], nestedBuilder);
+      nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
+    });
+
+  rewriter.replaceOp(linalgOp, genericOp);
+  return success();
+}
+
 // After the inner tile operation, promote the two affine.apply and the first extracted
 // slice if chd = IS or the second extracted slice if schd = WS, to the outer loop
 static LogicalResult
@@ -483,9 +575,9 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // Order:
   // Input Stationary: N, NC, NWIN, NF
   // Weight Stationary: N, NC, NF, NWIN
-  int64_t nFOrder = res.schd == IS ? 3 : 2;
-  int64_t nWinOrder = res.schd == IS ? 2 : 3;
-  SmallVector<int64_t, 4> tileInterchange = {0, nFOrder, nWinOrder, 1};
+  int64_t inner = res.schd == IS ? 2 : 1;
+  int64_t other = res.schd == IS ? 1 : 2;
+  SmallVector<int64_t, 4> tileInterchange = {0, 3, other, inner};
 
   scf::SCFTilingOptions tilingOptions;
   tilingOptions.setTileSizes(tileSizesOfr).setInterchange(tileInterchange);
@@ -533,7 +625,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
 
-  // Promote some inner loop Ops depends of schedule (WS or IS)
+  // Promote some inner loop Ops depending on the schedule (WS or IS)
   LogicalResult result0 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
   if (failed(result0)) return transformOp->emitError("failed to hosting Ops");
 
@@ -544,6 +636,10 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // Generate the input packing
   LogicalResult result2 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
   if (failed(result2)) return transformOp->emitError("failed to apply the input packing");
+
+  // Fix the inner conv op with packed input & filter
+  LogicalResult result3 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result3)) return transformOp->emitError("failed to fix the inner conv after packing");
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))

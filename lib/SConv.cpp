@@ -187,13 +187,13 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   // Get the body of the inner loop
   Block *innerBody = innerLoop.getBody();
 
-  // Get the inner (generic) convOp
+  // Get the uKernel (convOp)
   auto convOp = tiledOps.front();
   Location loc = convOp->getLoc();
 
-  // Cast to linalg::GenericOp
+  // Cast uKernel to linalg::GenericOp
   auto linalgOp = dyn_cast<linalg::GenericOp>(convOp);
-  if (!linalgOp) return transformOp->emitError("failed to get the inner convOp");
+  if (!linalgOp) return transformOp->emitError("failed to get the uKernel (convOp)");
 
   // get input & filter based on the schedule
   linalg::GenericOp outPackOp;
@@ -214,15 +214,12 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   Value input = res.schd == IS ? outPackOp.getResult(0) : innPackOp.getResult(0); 
   Value filter = res.schd == WS ? outPackOp.getResult(0) : innPackOp.getResult(0); 
 
-  auto inputType = cast<ShapedType>(input.getType());
-  auto filterType = cast<ShapedType>(filter.getType());
-
   // Create the new iterator types
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
   SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction};
 
-  // Create the new maps
+  // Create the new affine maps
   AffineExpr d0, d1, d2, d3;
   bindDims(context, d0, d1, d2, d3);
   auto lhsMap = AffineMap::get(4, 0, {d0, d3, d2}, context);
@@ -232,7 +229,7 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   // set the insertion point
   rewriter.setInsertionPoint(linalgOp);
 
-  // replace the convOp
+  // create the new uKernel
   auto genericOp = rewriter.create<linalg::GenericOp>(
     loc,
     linalgOp.getOutputs()[0].getType(),
@@ -246,14 +243,16 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
     });
 
-  // Replace uses of the linalg operations starting at the inner loop body
+  // Replace uses of the old uKernel (linalgOp) at the inner loop body
+  // to new uKernel (genericOp)
   innerBody->walk([&](Operation *op) {
     for (auto &operand : op->getOpOperands()) {
       if (operand.get() == linalgOp->getResult(0))
         operand.set(genericOp->getResult(0));
     }
   });
-  if (linalgOp.getResult(0).use_empty()) { // Ensure the linalgOp is not used
+  // Ensure the old uKernel (linalgOp) is not used anymore
+  if (linalgOp.getResult(0).use_empty()) {
     // First, iterate through the tiledOps to find convOp
     for (auto &op : tiledOps) {
       if (op == convOp) {
@@ -261,9 +260,8 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
         break;
       }
     }
-    // Now, replace the linalgOp to genericOp
-    // rewriter.replaceOp(linalgOp, genericOp);
-    linalgOp.erase();
+    // Now, erase the old uKernel
+    rewriter.eraseOp(convOp);
     return success();
   } else {
     return transformOp->emitError("old microkernel is still in use");
@@ -595,8 +593,8 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // Order:
   // Input Stationary: N, NC, NWIN, NF
   // Weight Stationary: N, NC, NF, NWIN
-  int64_t inner = res.schd == IS ? 2 : 1;
-  int64_t other = res.schd == IS ? 1 : 2;
+  int64_t inner = res.schd == IS ? 1 : 2;
+  int64_t other = res.schd == IS ? 2 : 1;
   SmallVector<int64_t, 4> tileInterchange = {0, 3, other, inner};
 
   scf::SCFTilingOptions tilingOptions;
@@ -768,8 +766,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   CSAStrategy res = csa();
   
   /* Just for test */
-  /* res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16; */
-  res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
+  res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
   /* Comment the code above to use the CSA Analysis */
 
   // Apply the tile in the genericOp based on the CSA Analysis

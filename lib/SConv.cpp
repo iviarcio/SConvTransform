@@ -246,8 +246,28 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
     });
 
-  rewriter.replaceOp(linalgOp, genericOp);
-  return success();
+  // Replace uses of the linalg operations starting at the inner loop body
+  innerBody->walk([&](Operation *op) {
+    for (auto &operand : op->getOpOperands()) {
+      if (operand.get() == linalgOp->getResult(0))
+        operand.set(genericOp->getResult(0));
+    }
+  });
+  if (linalgOp.getResult(0).use_empty()) { // Ensure the linalgOp is not used
+    // First, iterate through the tiledOps to find convOp
+    for (auto &op : tiledOps) {
+      if (op == convOp) {
+        op = genericOp; // Replace convOp with new genericOp
+        break;
+      }
+    }
+    // Now, replace the linalgOp to genericOp
+    // rewriter.replaceOp(linalgOp, genericOp);
+    linalgOp.erase();
+    return success();
+  } else {
+    return transformOp->emitError("old microkernel is still in use");
+  }
 }
 
 // After the inner tile operation, promote the two affine.apply and the first extracted

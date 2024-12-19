@@ -167,29 +167,25 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   // Get context
   MLIRContext *context = rewriter.getContext();
 
+  // Get the uKernel (convOp)
+  auto convOp = tiledOps.front();
+  Location loc = convOp->getLoc();
+  // set the insertion point
+  rewriter.setInsertionPoint(convOp);
+
   // get the outer loop
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  if (!outerLoop) return transformOp->emitError("failed to get the outermost scf::for op");
+  if (!outerLoop) return transformOp->emitError("failed to get the outer forOp");
 
   // Get the body of the outer loop
   Block *outerBody = outerLoop.getBody();
 
-  // Locate the inner loop within the outer loop's body
-  scf::ForOp innerLoop;
-  for (Operation &op : outerBody->getOperations()) {
-    if (auto loop = dyn_cast<scf::ForOp>(&op)) {
-      innerLoop = loop;
-      break;
-    }
-  }
+  // Get the inner loop 
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
   if (!innerLoop) return transformOp->emitError("failed to get the inner forOp");
 
   // Get the body of the inner loop
   Block *innerBody = innerLoop.getBody();
-
-  // Get the uKernel (convOp)
-  auto convOp = tiledOps.front();
-  Location loc = convOp->getLoc();
 
   // Cast uKernel to linalg::GenericOp
   auto linalgOp = dyn_cast<linalg::GenericOp>(convOp);
@@ -211,10 +207,11 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
     }
   }
 
+  // get the input & filter to new uKernel
   Value input = res.schd == IS ? outPackOp.getResult(0) : innPackOp.getResult(0); 
   Value filter = res.schd == WS ? outPackOp.getResult(0) : innPackOp.getResult(0); 
 
-  // Create the new iterator types
+  // Create the iterator types for new uKernel
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
   SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction};
@@ -225,9 +222,6 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   auto lhsMap = AffineMap::get(4, 0, {d0, d3, d2}, context);
   auto rhsMap = AffineMap::get(4, 0, {d3, d1}, context);
   auto resultMap = AffineMap::get(4, 0, {d0, d1, d2}, context);
-
-  // set the insertion point
-  rewriter.setInsertionPoint(linalgOp);
 
   // create the new uKernel
   auto genericOp = rewriter.create<linalg::GenericOp>(
@@ -244,7 +238,7 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
     });
 
   // Replace uses of the old uKernel (linalgOp) at the inner loop body
-  // to new uKernel (genericOp)
+  // to the new uKernel (genericOp)
   innerBody->walk([&](Operation *op) {
     for (auto &operand : op->getOpOperands()) {
       if (operand.get() == linalgOp->getResult(0))

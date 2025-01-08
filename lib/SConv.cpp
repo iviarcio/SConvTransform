@@ -237,25 +237,38 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
     });
 
-  // Replace uses of the old uKernel (linalgOp) at the inner loop body
-  // to the new uKernel (genericOp)
-  innerBody->walk([&](Operation *op) {
-    for (auto &operand : op->getOpOperands()) {
-      if (operand.get() == linalgOp->getResult(0))
-        operand.set(genericOp->getResult(0));
+  // Replace all uses of the uKernel linalgOp to the new uKernel genericOp
+  linalgOp.getResult(0).replaceAllUsesWith(genericOp.getResult(0));
+
+  // replace linalgOp with the new ukernel gennericOp
+  // rewriter.replaceOp(convOp, genericOp});
+
+  // Remove all operations that use the linalgOp, directly or indirectly.
+  innerBody->walk<WalkOrder::PostOrder>([&](Operation *op) {
+    if (llvm::any_of(op->getOperands(), [&](Value operand) { 
+        return operand == linalgOp.getResult(0); })) {
+      rewriter.eraseOp(op);
     }
   });
+
+  // Check if all operations that use the linalgOp are removed
+  innerBody->walk([&](Operation *op) {
+    if (op->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>()) {
+        llvm::dbgs() << "Op ainda usa linalgOp: " << *op << "\n";
+    }
+  });
+
   // Ensure the old uKernel (linalgOp) is not used anymore
   if (linalgOp.getResult(0).use_empty()) {
     // First, iterate through the tiledOps to find convOp
     for (auto &op : tiledOps) {
       if (op == convOp) {
-        op = genericOp; // Replace convOp with new genericOp
+        op = genericOp; // Replace it to new genericOp
         break;
       }
     }
     // Now, erase the old uKernel
-    rewriter.eraseOp(convOp);
+    rewriter.eraseOp(linalgOp);
     return success();
   } else {
     return transformOp->emitError("old microkernel is still in use");

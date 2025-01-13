@@ -238,25 +238,40 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
     });
 
   // Replace all uses of the uKernel linalgOp to the new uKernel genericOp
-  linalgOp.getResult(0).replaceAllUsesWith(genericOp.getResult(0));
+  for (auto res : linalgOp.getResults()) {
+    res.replaceAllUsesWith(genericOp.getResult(0));
+  }
 
   // replace linalgOp with the new ukernel gennericOp
   rewriter.replaceOp(linalgOp, genericOp);
 
-  // Remove all operations that use the linalgOp, directly or indirectly.
-  outerBody->walk<WalkOrder::PostOrder>([&](Operation *op) {
-    if (llvm::any_of(op->getOperands(), [&](Value operand) { 
-        return operand == linalgOp.getResult(0); })) {
-      rewriter.eraseOp(op);
+  // Replace all extractOp or affineOp that use the linalgOp.
+  outerBody->walk([&](Operation *op) {
+    if (auto extractOp = dyn_cast<tensor::ExtractSliceOp>(op)) {
+      if (extractOp.getSource().getDefiningOp() == linalgOp) {
+        extractOp.replaceAllUsesWith(genericOp.getResult(0));
+      }
+    } else if (auto affineOp = dyn_cast<AffineApplyOp>(op)) {
+      for (auto &operand : affineOp->getOpOperands()) {
+        if (operand.get().getDefiningOp() == linalgOp) {
+          operand.set(genericOp.getResult(0));
+        }
+      }
     }
   });
 
-  // Check if all operations that use the linalgOp are removed
-  outerBody->walk([&](Operation *op) {
-    if (op->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>()) {
-        llvm::dbgs() << "Op still using linalgOp: " << *op << "\n";
+  // Collect all pending operations and remove them
+  SmallVector<Operation *, 4> dependentOps;
+  outerBody->walk<WalkOrder::PostOrder>([&](Operation *op) {
+    if (llvm::any_of(op->getOperands(), [&](Value operand) {
+          return operand.getDefiningOp() == linalgOp;
+        })) {
+      dependentOps.push_back(op);
     }
   });
+  for (Operation *op : llvm::reverse(dependentOps)) {
+    rewriter.eraseOp(op);
+  }
 
   // Iterate through the tiledOps to find convOp and replace it to new genericOp
   for (auto &op : tiledOps) {
@@ -266,14 +281,12 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
     }
   }
 
-  // Ensure the old uKernel (linalgOp) is not used anymore
-  if (linalgOp.getResult(0).use_empty()) {
-    // So, erase it
+  // Erase linalgOp after to ensure that the old uKernel is not used anymore
+  if (llvm::all_of(linalgOp.getResults(), [](Value res) { return res.use_empty(); })) {
     // rewriter.eraseOp(linalgOp);
-    return success();
-  } else {
-    return transformOp->emitError("old microkernel is still in use");
   }
+
+  return success();
 }
 
 // After the inner tile operation, promote the two affine.apply and the first extracted
@@ -665,7 +678,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
 
   // Fix the inner conv op with packed input & filter
   LogicalResult result3 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result3)) return transformOp->emitError("failed to fix the inner conv after packing");
+  if (failed(result3)) return transformOp->emitError("failed to replace the ukernel after packing");
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))

@@ -159,7 +159,7 @@ static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
 }
 
 // After the packing operations, the linalOps (innermost conv) must be fixed to 
-// get the packed input & filter. Also, fix the iteraor types & maps.
+// get the packed input & filter. Also, fix the iterator types & maps.
 static LogicalResult
 adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                 SmallVector<Operation *> tiledOps, SmallVector<Operation *> loopOps) {
@@ -241,10 +241,10 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   linalgOp.getResult(0).replaceAllUsesWith(genericOp.getResult(0));
 
   // replace linalgOp with the new ukernel gennericOp
-  // rewriter.replaceOp(convOp, genericOp});
+  rewriter.replaceOp(linalgOp, genericOp);
 
   // Remove all operations that use the linalgOp, directly or indirectly.
-  innerBody->walk<WalkOrder::PostOrder>([&](Operation *op) {
+  outerBody->walk<WalkOrder::PostOrder>([&](Operation *op) {
     if (llvm::any_of(op->getOperands(), [&](Value operand) { 
         return operand == linalgOp.getResult(0); })) {
       rewriter.eraseOp(op);
@@ -252,23 +252,24 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   });
 
   // Check if all operations that use the linalgOp are removed
-  innerBody->walk([&](Operation *op) {
+  outerBody->walk([&](Operation *op) {
     if (op->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>()) {
-        llvm::dbgs() << "Op ainda usa linalgOp: " << *op << "\n";
+        llvm::dbgs() << "Op still using linalgOp: " << *op << "\n";
     }
   });
 
+  // Iterate through the tiledOps to find convOp and replace it to new genericOp
+  for (auto &op : tiledOps) {
+    if (op == convOp) {
+      op = genericOp;
+      break;
+    }
+  }
+
   // Ensure the old uKernel (linalgOp) is not used anymore
   if (linalgOp.getResult(0).use_empty()) {
-    // First, iterate through the tiledOps to find convOp
-    for (auto &op : tiledOps) {
-      if (op == convOp) {
-        op = genericOp; // Replace it to new genericOp
-        break;
-      }
-    }
-    // Now, erase the old uKernel
-    rewriter.eraseOp(linalgOp);
+    // So, erase it
+    // rewriter.eraseOp(linalgOp);
     return success();
   } else {
     return transformOp->emitError("old microkernel is still in use");

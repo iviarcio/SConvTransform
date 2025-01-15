@@ -273,17 +273,12 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
     rewriter.eraseOp(op);
   }
 
-  // Iterate through the tiledOps to find convOp and replace it to new genericOp
+  // Iterate through the tiledOps to find convOp and replace it to genericOp
   for (auto &op : tiledOps) {
     if (op == convOp) {
       op = genericOp;
       break;
     }
-  }
-
-  // Erase linalgOp after to ensure that the old uKernel is not used anymore
-  if (llvm::all_of(linalgOp.getResults(), [](Value res) { return res.use_empty(); })) {
-    // rewriter.eraseOp(linalgOp);
   }
 
   return success();
@@ -787,7 +782,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   CSAStrategy res = csa();
   
   /* Just for test */
-  res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
+  // res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
+  res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
   /* Comment the code above to use the CSA Analysis */
 
   // Apply the tile in the genericOp based on the CSA Analysis

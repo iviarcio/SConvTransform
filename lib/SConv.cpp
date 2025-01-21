@@ -609,9 +609,9 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // Order:
   // Input Stationary: N, NC, NWIN, NF
   // Weight Stationary: N, NC, NF, NWIN
+  int64_t outer = res.schd == IS ? 2 : 1;
   int64_t inner = res.schd == IS ? 1 : 2;
-  int64_t other = res.schd == IS ? 2 : 1;
-  SmallVector<int64_t, 4> tileInterchange = {0, 3, other, inner};
+  SmallVector<int64_t, 4> tileInterchange = {0, 3, outer, inner};
 
   scf::SCFTilingOptions tilingOptions;
   tilingOptions.setTileSizes(tileSizesOfr).setInterchange(tileInterchange);
@@ -633,8 +633,8 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   SmallVector<OpFoldResult> innerTileSizesOfr = getAsIndexOpFoldResult(rewriter.getContext(), innerTileSize);
 
   int64_t innerFOrder = res.schd == IS ? 1 : 0;
-  int64_t innerWinOrder = res.schd == IS ? 0 : 1;
-  SmallVector<int64_t, 2> innerInterchange = {innerFOrder, innerWinOrder};
+  int64_t innerSOrder = res.schd == IS ? 0 : 1;
+  SmallVector<int64_t, 2> innerInterchange = {innerFOrder, innerSOrder};
 
   auto innerTilingInterfaceOp = dyn_cast<TilingInterface>(innerOp);
   if (!innerTilingInterfaceOp)

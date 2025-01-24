@@ -13,7 +13,7 @@
 #include "SConv.h"
 
 #include "CSA.h"
-
+#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/IR/TransformOps.h"
@@ -33,10 +33,12 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/SmallVector.h"
@@ -167,25 +169,22 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   // Get context
   MLIRContext *context = rewriter.getContext();
 
+  // Validate input loops
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  if (!outerLoop || !innerLoop)
+    return transformOp->emitError("Loops must be scf.for");
+
+  // Get the body of the loops
+  Block *outerBody = outerLoop.getBody();
+  Block *innerBody = innerLoop.getBody();
+
   // Get the uKernel (convOp)
   auto convOp = tiledOps.front();
   Location loc = convOp->getLoc();
+
   // set the insertion point
   rewriter.setInsertionPoint(convOp);
-
-  // get the outer loop
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  if (!outerLoop) return transformOp->emitError("failed to get the outer forOp");
-
-  // Get the body of the outer loop
-  Block *outerBody = outerLoop.getBody();
-
-  // Get the inner loop 
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
-  if (!innerLoop) return transformOp->emitError("failed to get the inner forOp");
-
-  // Get the body of the inner loop
-  Block *innerBody = innerLoop.getBody();
 
   // Cast uKernel to linalg::GenericOp
   auto linalgOp = dyn_cast<linalg::GenericOp>(convOp);
@@ -242,7 +241,7 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
     res.replaceAllUsesWith(genericOp.getResult(0));
   }
 
-  // replace linalgOp with the new ukernel gennericOp
+  // replace linalgOp with the new uKernel gennericOp
   rewriter.replaceOp(linalgOp, genericOp);
 
   // Replace all extractOp or affineOp that use the linalgOp.
@@ -290,25 +289,14 @@ static LogicalResult
 promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
                  CSAStrategy res, SmallVector<Operation *> loopOps) {
 
-  // Cast to scf::ForOp the  outermost loop of the second tile
-  int i = 0;
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[i]);
-  if (!outerLoop) return transformOp->emitError("failed to get the outermost scf::for op");
+  // Validate input loops
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  if (!outerLoop || !innerLoop)
+    return transformOp->emitError("Loops must be scf.for");
 
-  // Get the body of the outer loop
+  // Get the body of the loops
   Block *outerBody = outerLoop.getBody();
-
-  // Locate the inner loop within the outer loop's body
-  scf::ForOp innerLoop;
-  for (Operation &op : outerBody->getOperations()) {
-    if (auto loop = dyn_cast<scf::ForOp>(&op)) {
-      innerLoop = loop;
-      break;
-    }
-  }
-  if (!innerLoop) return transformOp->emitError("failed to get the inner forOp");
-
-  // Get the body of the inner loop
   Block *innerBody = innerLoop.getBody();
 
   Operation *affineApply1 = nullptr;
@@ -398,7 +386,7 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAS
   if (!loopOp) return transformOp->emitError("failed to get the inner scf::for op");
   Block *loopBody = loopOp.getBody();
 
-  // Get the inner (generic) convOp
+  // Get the uKernel
   auto convOp = tiledOps.front();
 
   // Cast to linalg::GenericOp to get the input & filter, types & shapes
@@ -493,7 +481,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
   if (!loopOp) return transformOp->emitError("failed to get the inner scf::for op");
   Block *loopBody = loopOp.getBody();
 
-  // Get the inner (generic) convOp
+  // Get the ukernel
   auto convOp = tiledOps.front();
 
   // Cast to linalg::GenericOp to get the input & filter, types & shapes
@@ -584,6 +572,85 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
   return success();
 }
 
+// Swap the inner loops when schedule is Input Stationary
+static LogicalResult
+swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
+                  SmallVector<Operation *> tiledOps, SmallVector<Operation *> &loopOps) {
+
+  if (res.schd == IS) {
+    // Validate input loops
+    auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+    auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+    if (!outerLoop || !innerLoop)
+      return transformOp->emitError("Loops must be scf.for");
+
+    // Capture induction variables
+    Value outerInductionVar = outerLoop.getInductionVar();
+    Value innerInductionVar = innerLoop.getInductionVar();
+
+    // Create mappings for swapping induction variables
+    IRMapping mapping;
+    mapping.map(outerInductionVar, innerInductionVar);
+    mapping.map(innerInductionVar, outerInductionVar);
+
+    // Clone the inner loop into the outer loop's place
+    rewriter.setInsertionPoint(outerLoop);
+    auto newOuterLoop = rewriter.create<scf::ForOp>(
+        outerLoop.getLoc(), innerLoop.getLowerBound(), innerLoop.getUpperBound(),
+        innerLoop.getStep(), innerLoop.getInitArgs());
+
+    // Clone the outer loop into the inner loop's place
+    rewriter.setInsertionPointToStart(newOuterLoop.getBody());
+    auto newInnerLoop = rewriter.create<scf::ForOp>(
+        innerLoop.getLoc(), outerLoop.getLowerBound(), outerLoop.getUpperBound(),
+        outerLoop.getStep(), outerLoop.getInitArgs());
+
+    // Move the bodies of the original loops
+    rewriter.setInsertionPointToStart(newInnerLoop.getBody());
+    for (Operation &op : *innerLoop.getBody()) {
+      rewriter.clone(op, mapping);
+    }
+    rewriter.setInsertionPointToStart(newOuterLoop.getBody());
+    for (Operation &op : *outerLoop.getBody()) {
+      if (&op == innerLoop.getOperation())  // Avoid cloning the inner loop into itself
+        continue;
+      rewriter.clone(op, mapping);
+    }
+
+    // Replace all uses of the original loops' results
+    auto outerResults = outerLoop.getResults();
+    auto newOuterResults = newOuterLoop.getResults();
+    for (auto [oldRes, newRes] : llvm::zip(outerResults, newOuterResults)) {
+      oldRes.replaceAllUsesWith(newRes);
+    }
+    auto innerResults = innerLoop.getResults();
+    auto newInnerResults = newInnerLoop.getResults();
+    for (auto [oldRes, newRes] : llvm::zip(innerResults, newInnerResults)) {
+      oldRes.replaceAllUsesWith(newRes);
+    }
+
+    // Update loopOps with new loops
+    loopOps[0] = newOuterLoop.getOperation();
+    loopOps[1] = newInnerLoop.getOperation();
+
+    // get the uKernel inside new innerLoop Body
+    linalg::GenericOp uKernelOp;
+    for (Operation &op : newInnerLoop.getBody()->getOperations()) {
+      if (auto genOp = dyn_cast<linalg::GenericOp>(&op)) {
+        uKernelOp = genOp;
+        break;
+      }
+    }
+    tiledOps[0] = uKernelOp;  // Update tiledOps with new uKernel
+
+    // Erase the original loops
+    rewriter.eraseOp(innerLoop);
+    rewriter.eraseOp(outerLoop);
+  }
+
+  return success();
+}
+
 // Apply a tiling transformation to a modified payload ops and store both the
 // tiled operation as well as the created tile loops.
 static LogicalResult
@@ -659,21 +726,25 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   for (Operation *loop : tiledResults->loops)
     loopOps.push_back(loop);
 
+  // Swap the innner loops in the case of Input Stationary
+  LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
+
   // Promote some inner loop Ops depending on the schedule (WS or IS)
-  LogicalResult result0 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
-  if (failed(result0)) return transformOp->emitError("failed to hosting Ops");
+  LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
+  if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
 
   // Generate the filter packing
-  LogicalResult result1 = applyFilterPacking(rewriter, transformOp, csa, res, tiledOps, loopOps);
-  if (failed(result1)) return transformOp->emitError("failed to apply the filter packing");
+  LogicalResult result2 = applyFilterPacking(rewriter, transformOp, csa, res, tiledOps, loopOps);
+  if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
 
   // Generate the input packing
-  LogicalResult result2 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
-  if (failed(result2)) return transformOp->emitError("failed to apply the input packing");
+  LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
+  if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
 
   // Fix the inner conv op with packed input & filter
-  LogicalResult result3 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result3)) return transformOp->emitError("failed to replace the ukernel after packing");
+  LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))

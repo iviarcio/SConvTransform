@@ -620,10 +620,21 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
     }
   }
 
+  // Lookup the tensor.insert_slice op in the innerLoop Body
+  tensor::InsertSliceOp insertSliceOp = nullptr;
+  for (Operation &op : newInnerLoop.getBody()->getOperations()) {
+    if (auto candidate = dyn_cast<tensor::InsertSliceOp>(&op)) {
+      if (insertSliceOp)
+        return transformOp->emitError("Multiple tensor.insert_slice operations found in the innerLoop body");
+      insertSliceOp = candidate;
+    }
+  }
+  if (!insertSliceOp)
+    return transformOp->emitError("No tensor.insert_slice operation found in the innerLoop body");
+
   // Add a yield operation for the new innerLoop
   rewriter.setInsertionPointToEnd(newInnerLoop.getBody());
-  auto yieldValuesInner = llvm::to_vector(newInnerLoop.getRegionIterArgs());
-  rewriter.create<scf::YieldOp>(innerLoop.getLoc(), ValueRange(yieldValuesInner));
+  rewriter.create<scf::YieldOp>(innerLoop.getLoc(), insertSliceOp.getResult());
 
   // Clone the outer loop's body into the new outerLoop
   rewriter.setInsertionPointToStart(newOuterLoop.getBody());
@@ -638,8 +649,8 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
 
   // Add a yield operation for the new outerLoop
   rewriter.setInsertionPointToEnd(newOuterLoop.getBody());
-  auto yieldValuesOuter = llvm::to_vector(newOuterLoop.getRegionIterArgs());
-  rewriter.create<scf::YieldOp>(outerLoop.getLoc(), ValueRange(yieldValuesOuter));
+  Value yieldValueOuter = newInnerLoop.getResults().front();
+  rewriter.create<scf::YieldOp>(outerLoop.getLoc(), yieldValueOuter);
 
   llvm::errs() << "\nDump after clonning outerLoop:\n";
   newOuterLoop.dump();

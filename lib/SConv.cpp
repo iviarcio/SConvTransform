@@ -577,82 +577,99 @@ static LogicalResult
 swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                   SmallVector<Operation *> tiledOps, SmallVector<Operation *> &loopOps) {
 
-  if (res.schd == IS) {
-    // Validate input loops
-    auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-    auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
-    if (!outerLoop || !innerLoop)
-      return transformOp->emitError("Loops must be scf.for");
+  if (res.schd != IS) return success();
 
-    // Capture induction variables
-    Value outerInductionVar = outerLoop.getInductionVar();
-    Value innerInductionVar = innerLoop.getInductionVar();
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  if (!outerLoop || !innerLoop)
+    return transformOp->emitError("Loops must be scf.for");
 
-    // Create mappings for swapping induction variables
-    IRMapping mapping;
-    mapping.map(outerInductionVar, innerInductionVar);
-    mapping.map(innerInductionVar, outerInductionVar);
+  // Create the new outerLoop with innerLoop args, except InitArgs
+  rewriter.setInsertionPoint(outerLoop);
+  auto newOuterLoop = rewriter.create<scf::ForOp>(
+      outerLoop.getLoc(), innerLoop.getLowerBound(), innerLoop.getUpperBound(),
+      innerLoop.getStep(), outerLoop.getInitArgs());
 
-    // Clone the inner loop into the outer loop's place
-    rewriter.setInsertionPoint(outerLoop);
-    auto newOuterLoop = rewriter.create<scf::ForOp>(
-        outerLoop.getLoc(), innerLoop.getLowerBound(), innerLoop.getUpperBound(),
-        innerLoop.getStep(), innerLoop.getInitArgs());
+  // Create the new innerLoop with outerLoop args, except InitArgs
+  rewriter.setInsertionPointToStart(newOuterLoop.getBody());
+  auto newInnerLoop = rewriter.create<scf::ForOp>(
+      innerLoop.getLoc(), outerLoop.getLowerBound(), outerLoop.getUpperBound(),
+      outerLoop.getStep(), newOuterLoop.getRegionIterArgs());
 
-    // Clone the outer loop into the inner loop's place
-    rewriter.setInsertionPointToStart(newOuterLoop.getBody());
-    auto newInnerLoop = rewriter.create<scf::ForOp>(
-        innerLoop.getLoc(), outerLoop.getLowerBound(), outerLoop.getUpperBound(),
-        outerLoop.getStep(), outerLoop.getInitArgs());
+  // Create mappings for swapping induction variables
+  IRMapping mapping;
+  mapping.map(outerLoop.getInductionVar(), newInnerLoop.getInductionVar());
+  mapping.map(innerLoop.getInductionVar(), newOuterLoop.getInductionVar());
 
-    // Move the bodies of the original loops
-    rewriter.setInsertionPointToStart(newInnerLoop.getBody());
-    for (Operation &op : *innerLoop.getBody()) {
-      rewriter.clone(op, mapping);
-    }
-    rewriter.setInsertionPointToStart(newOuterLoop.getBody());
-    for (Operation &op : *outerLoop.getBody()) {
-      if (&op == innerLoop.getOperation())  // Avoid cloning the inner loop into itself
-        continue;
-      rewriter.clone(op, mapping);
-    }
+  // Map the iterative arguments of the innerLoop and outerLoop
+    for (auto [oldArg, newArg] : llvm::zip(outerLoop.getRegionIterArgs(), newOuterLoop.getRegionIterArgs())) {
+    mapping.map(oldArg, newArg);
+  }
+  for (auto [oldArg, newArg] : llvm::zip(innerLoop.getRegionIterArgs(), newInnerLoop.getRegionIterArgs())) {
+    mapping.map(oldArg, newArg);
+  }
 
-    // Replace all uses of the original loops' results
-    auto outerResults = outerLoop.getResults();
-    auto newOuterResults = newOuterLoop.getResults();
-    for (auto [oldRes, newRes] : llvm::zip(outerResults, newOuterResults)) {
-      oldRes.replaceAllUsesWith(newRes);
-    }
-    auto innerResults = innerLoop.getResults();
-    auto newInnerResults = newInnerLoop.getResults();
-    for (auto [oldRes, newRes] : llvm::zip(innerResults, newInnerResults)) {
-      oldRes.replaceAllUsesWith(newRes);
-    }
-
-    // Update loopOps with new loops
-    loopOps[0] = newOuterLoop.getOperation();
-    loopOps[1] = newInnerLoop.getOperation();
-
-    // get the uKernel inside new innerLoop Body
-    linalg::GenericOp uKernelOp;
-    for (Operation &op : newInnerLoop.getBody()->getOperations()) {
-      if (auto genOp = dyn_cast<linalg::GenericOp>(&op)) {
-        uKernelOp = genOp;
-        break;
+  // Clone the inner loop's body into the new innerLoop
+  rewriter.setInsertionPointToStart(newInnerLoop.getBody());
+  for (Operation &op : *innerLoop.getBody()) {
+    if (!isa<scf::YieldOp>(&op)) {
+      Operation *clonedOp = rewriter.clone(op, mapping);
+      for (auto [oldResult, newResult] : llvm::zip(op.getResults(), clonedOp->getResults())) {
+        mapping.map(oldResult, newResult);
       }
     }
-    tiledOps[0] = uKernelOp;  // Update tiledOps with new uKernel
-
-    // Erase the original loops
-    rewriter.eraseOp(innerLoop);
-    rewriter.eraseOp(outerLoop);
   }
+
+  // Add a yield operation for the new innerLoop
+  rewriter.setInsertionPointToEnd(newInnerLoop.getBody());
+  auto yieldValuesInner = llvm::to_vector(newInnerLoop.getRegionIterArgs());
+  rewriter.create<scf::YieldOp>(innerLoop.getLoc(), ValueRange(yieldValuesInner));
+
+  // Clone the outer loop's body into the new outerLoop
+  rewriter.setInsertionPointToStart(newOuterLoop.getBody());
+  for (Operation &op : *outerLoop.getBody()) {
+    if (&op != innerLoop.getOperation() && !isa<scf::YieldOp>(&op)) {
+      Operation *clonedOp = rewriter.clone(op, mapping);
+      for (auto [oldResult, newResult] : llvm::zip(op.getResults(), clonedOp->getResults())) {
+        mapping.map(oldResult, newResult);
+      }
+    }
+  }
+
+  // Add a yield operation for the new outerLoop
+  rewriter.setInsertionPointToEnd(newOuterLoop.getBody());
+  auto yieldValuesOuter = llvm::to_vector(newOuterLoop.getRegionIterArgs());
+  rewriter.create<scf::YieldOp>(outerLoop.getLoc(), ValueRange(yieldValuesOuter));
+
+  llvm::errs() << "\nDump after clonning outerLoop:\n";
+  newOuterLoop.dump();
+
+  // Replace all uses of the original loops' results
+  for (auto [oldRes, newRes] : llvm::zip(innerLoop.getResults(), newInnerLoop.getResults())) {
+    oldRes.replaceAllUsesWith(newRes);
+  }
+  for (auto [oldRes, newRes] : llvm::zip(outerLoop.getResults(), newOuterLoop.getResults())) {
+    oldRes.replaceAllUsesWith(newRes);
+  }
+
+  rewriter.eraseOp(innerLoop);
+  rewriter.eraseOp(outerLoop);
+
+  // Update the uKernel to the new one in the innerLoop Body
+  tiledOps[0] = *newInnerLoop.getBody()->getOps<linalg::GenericOp>().begin();
+
+  // Update the loops
+  loopOps[0] = newOuterLoop.getOperation();
+  loopOps[1] = newInnerLoop.getOperation();
+
+  llvm::errs() << "\nDump after replacements:\n";
+  newOuterLoop.dump();
 
   return success();
 }
 
 // Apply a tiling transformation to a modified payload ops and store both the
-// tiled operation as well as the created tile loops.
+// tiled operation  (uKernel) as well as the created tile loops.
 static LogicalResult
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
             CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, 

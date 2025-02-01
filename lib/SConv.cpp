@@ -836,7 +836,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   
   /* Just for test */
   // res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
-  res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
+  // res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
   /* Comment the code above to use the CSA Analysis */
 
   // Apply the tile in the genericOp based on the CSA Analysis

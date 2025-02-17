@@ -635,9 +635,9 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
 
 // Apply a Multi-Packing Optimization.
 // Pack multiple (input) tiles, adding another dimension to the packed tensor,
-// and skip K * N_win elements per iteration on WS. (TODO)
-// Pack multiple (filter) tiles adding a new dimension to the tensor 𝐾2 which
-// iterates over groups of N_f filters on IS.
+// and skip K * Nwin elements per iteration on WS. (TODO)
+// Pack multiple (filter) tiles adding a new dimension to the tensor k2 which
+// iterates over groups of Nf filters on IS.
 static LogicalResult
 multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
                           CSAStrategy res, SmallVector<Operation *> &tiledOps,
@@ -656,25 +656,25 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
   Location loc = outerLoop.getLoc();
   rewriter.setInsertionPoint(outerLoop);
 
-  // First, find the second extracted_slice in the nestLoop
+  // First, find the filter extracted_slice in the nestLoop
   Value filterSlice;
   int count = 0;
   nestLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
-    if (count == 1) {  // Get the second occurrence of ExtractSliceOp
+    if (count == 1) {  // It's the second occurrence of ExtractSliceOp
       filterSlice = op;
     }
     count++;
   });
 
-  // Then, get the extracted_slice that is used by the old packing
+  // Then, get the filter extracted_slice used by the old filerPacking
   Operation *extractedSlice = nullptr;
   innerLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
-    if (!extractedSlice) { // Get the first one in the inner loop
+    if (!extractedSlice) { // It's the first one in the inner loop
       extractedSlice = op;
     }
   });
 
-  // Last, create the Multi-Packed Filter with shape {Tc, Nc × Fh × Fw, Nf}
+  // Last, create the filterMultiPacking with shape {Tc, Nc × Fh × Fw, Nf}
   auto filter = extractedSlice->getResult(0);
   auto filterType = cast<ShapedType>(filter.getType());
   auto filterShape = filterType.getShape();
@@ -715,12 +715,13 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
     nestedBuilder.create<linalg::YieldOp>(nestedLoc, filterVal);
   });
 
-  // Insert new affine.apply at beginning of innerLoop body
+  // Create the affine.apply at beginning of innerLoop body
+  // to indexing the new filterSlice
   rewriter.setInsertionPointToStart(innerLoop.getBody());
   Value affineIndex = rewriter.create<AffineApplyOp>(
       innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(res.k2), context), innerLoop.getInductionVar());
 
-  // Define new offsets, sizes, and strides for updatedExtractedSlice
+  // Define new offsets, sizes, and strides for new extractedSlice
   SmallVector<OpFoldResult, 3> newSliceOffsets = {
       affineIndex, rewriter.getIndexAttr(0), rewriter.getIndexAttr(0) };
   SmallVector<OpFoldResult, 3> newSliceSizes = {
@@ -731,7 +732,7 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
   Value updatedExtractedSlice = rewriter.create<tensor::ExtractSliceOp>(
     innerLoop.getLoc(), newPackingTensor.getResult(0), newSliceOffsets, newSliceSizes, newSliceStrides);
 
-  // Apply tensor.collapse_shape
+  // Apply tensor.collapse_shape on the first two dimensions of new extractedSlice
   SmallVector<ReassociationIndices> collapseDims = {{0, 1}, {2}};
   Value collapsedSlice = rewriter.create<tensor::CollapseShapeOp>(
       innerLoop.getLoc(),
@@ -739,14 +740,14 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
       updatedExtractedSlice,
       collapseDims);
 
-  // Get the old uKernel & filterPacking
+  // Get the old uKernel & old filterPacking
   linalg::GenericOp linalgOp;
   linalg::GenericOp oFilterPacking;
   innerLoop.getBody()->walk([&](linalg::GenericOp op) {
     if (!oFilterPacking) {
       oFilterPacking = op; // Must be the first one
     }
-    linalgOp = op; // Get the last one in the loop
+    linalgOp = op; // It's the last one in the loop
   });
 
   // Set the insertion point to old uKernel

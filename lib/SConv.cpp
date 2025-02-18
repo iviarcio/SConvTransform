@@ -674,16 +674,16 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
     }
   });
 
-  // Last, create the filterMultiPacking with shape {Tc, Nc × Fh × Fw, Nf}
+  // Last, create the filterMultiPacking with shape {Tf, Nc × Fh × Fw, Nf}
   auto filter = extractedSlice->getResult(0);
   auto filterType = cast<ShapedType>(filter.getType());
   auto filterShape = filterType.getShape();
-  int64_t Tc = res.tile_c;
+  int64_t Tf = res.k2;          // num of tiles to the filter 
   int64_t Nf = filterShape[0];
   int64_t Nc = filterShape[1];
   int64_t Fh = filterShape[2];
   int64_t Fw = filterShape[3];
-  SmallVector<int64_t, 3> filterPackingShape = {Tc, Nc * Fh * Fw, Nf};
+  SmallVector<int64_t, 3> filterPackingShape = {Tf, Nc * Fh * Fw, Nf};
   Value filterPacking = rewriter.create<tensor::EmptyOp>(loc, filterPackingShape, filterType.getElementType());
 
   auto nloops = filterPackingShape.size();
@@ -1030,7 +1030,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   
   /* Just for test */
   // res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
-  res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
+  // res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
   /* Comment the code above to use the CSA Analysis */
 
   // Apply the tile in the genericOp based on the CSA Analysis

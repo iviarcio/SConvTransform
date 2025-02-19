@@ -160,8 +160,8 @@ static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
   return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
 }
 
-// After the packing operations, the linalOps (innermost conv) must be fixed to 
-// get the packed input & filter. Also, fix the iterator types & maps.
+// After the packing operations, the linalOps (uKernel) must be fixed to 
+// access the packed input & filter. Also, fix the iterator types & maps.
 static LogicalResult
 adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                 SmallVector<Operation *> &tiledOps, SmallVector<Operation *> loopOps) {
@@ -572,7 +572,8 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
   return success();
 }
 
-// Swap the inner loops when schedule is Input Stationary
+// Swap the inner loops when schedule is Input Stationary. Is there a bug on
+// scf::tileUsingSCF? innerInterchange has no effect!
 static LogicalResult
 swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                   SmallVector<Operation *> tiledOps, SmallVector<Operation *> &loopOps) {
@@ -633,15 +634,106 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
   return success();
 }
 
-// Apply a Multi-Packing Optimization.
-// Pack multiple (input) tiles, adding another dimension to the packed tensor,
-// and skip K * Nwin elements per iteration on WS. (TODO)
-// Pack multiple (filter) tiles adding a new dimension to the tensor k2 which
+// Pack multiple input tiles, adding another dimension to the packed tensor,
+// and skip K * Nwin elements per iteration on WS schedule.
+inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
+                     CSAStrategy res, SmallVector<Operation *> &tiledOps,
+                     SmallVector<Operation *> loopOps) {
+  if (res.schd != WS)
+    return success();
+
+  MLIRContext *context = rewriter.getContext();
+
+  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[5]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  if (!nestLoop || !outerLoop || !innerLoop)
+    return transformOp->emitError("Loops must be scf.for");
+
+  Location loc = outerLoop.getLoc();
+  rewriter.setInsertionPoint(outerLoop);
+
+  // First, find the input & filter extracted_slice in the nestLoop
+  Value inputSlice, filterSlice;
+  int count = 0;
+  nestLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
+    if (!inputSlice) {  // inputSlice is the first occurrence of ExtractSliceOp
+      inputSlice = op;
+    }
+    if (count == 1) {  // filterSlice is the second occurence
+      filterSlice = op;
+    }
+    count++;
+  });
+
+  // Then, get the input extracted_slice used by the old inputPacking
+  Operation *extractedSlice = nullptr;
+  innerLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
+    if (!extractedSlice) { // It's the first one in the inner loop
+      extractedSlice = op;
+    }
+  });
+
+  // Last, create the inputMultiPacking with shape {Ni, Ti, K, Nwin} 
+  // where Ti = res.k2, K = Nc * Fh * Fw, Nwin = Nw - Fw + 1
+  auto input = extractedSlice->getResult(0);
+  auto inputType = cast<ShapedType>(input.getType());
+  auto inputShape = inputType.getShape();
+  auto filter = filterSlice->getResult(0);
+  auto filterType = cast<ShapedType>(filter.getType());
+  auto filterShape = filterType.getShape();
+  int64_t Ti = res.k2;          // num of tiles to the input 
+  int64_t Ni = inputShape[0];
+  int64_t Nc = inputShape[1];
+  int64_t Nw = inputShape[3];
+  int64_t Fh = filterShape[2];
+  int64_t Fw = filterShape[3];
+  int64_t Nwin = Nw - Fw + 1;
+  SmallVector<int64_t, 4> inputPackingShape = {Ni, Ti, Nc * Fh * Fw, Nwin};
+  Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());
+
+  auto nloops = inputPackingShape.size();
+  auto parallel = utils::IteratorType::parallel;
+  SmallVector<utils::IteratorType, 4> packingIterators(nloops, parallel);
+  SmallVector<AffineMap, 4> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
+
+  auto newPackingTensor = rewriter.create<linalg::GenericOp>(
+    loc, inputPacking.getType(),
+    ValueRange{},
+    inputPacking,
+    packingIndexingMaps,
+    packingIterators,
+    [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+    Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0);
+    Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1);
+    Value index2 = nestedBuilder.create<linalg::IndexOp>(loc, 2);
+    Value index3 = nestedBuilder.create<linalg::IndexOp>(loc, 3);
+
+// TODO: extractionIndices
+
+    Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, inputSlice, extractionIndices);
+    nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
+  });
+
+  // Create the affine.apply at beginning of innerLoop body
+  // to indexing the new inputSlice
+  rewriter.setInsertionPointToStart(innerLoop.getBody());
+  Value affineIndex = rewriter.create<AffineApplyOp>(
+      innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(Nc), context), innerLoop.getInductionVar());
+ 
+// TODO: Define new offsets, sizes, and strides for new extractedSlice
+
+// TODO: Apply tensor.collapse_shape on the first two dimensions of new extractedSlice
+
+  return success;
+}
+
+// Pack multiple filter tiles adding a new dimension to the tensor k2 which
 // iterates over groups of Nf filters on IS.
 static LogicalResult
-multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
-                          CSAStrategy res, SmallVector<Operation *> &tiledOps,
-                          SmallVector<Operation *> loopOps) {
+filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
+                      CSAStrategy res, SmallVector<Operation *> &tiledOps,
+                      SmallVector<Operation *> loopOps) {
   if (res.schd != IS)
     return success();
 
@@ -666,7 +758,7 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
     count++;
   });
 
-  // Then, get the filter extracted_slice used by the old filerPacking
+  // Then, get the filter extracted_slice used by the old filterPacking
   Operation *extractedSlice = nullptr;
   innerLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
     if (!extractedSlice) { // It's the first one in the inner loop
@@ -708,7 +800,7 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
     Value FhIndex = unpackedIndices[1];
     Value FwIndex = unpackedIndices[2];
 
-    Value kIndex = getConvolvedIndex(nestedBuilder, nestedLoc, index0, index2, res.k2);
+    Value kIndex = getConvolvedIndex(nestedBuilder, nestedLoc, index0, index2, Nf);
     SmallVector<Value> extractionIndices{kIndex, NcIndex, FhIndex, FwIndex};
 
     Value filterVal = nestedBuilder.create<tensor::ExtractOp>(loc, filterSlice, extractionIndices);
@@ -719,7 +811,7 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
   // to indexing the new filterSlice
   rewriter.setInsertionPointToStart(innerLoop.getBody());
   Value affineIndex = rewriter.create<AffineApplyOp>(
-      innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(res.k2), context), innerLoop.getInductionVar());
+      innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(Nf), context), innerLoop.getInductionVar());
 
   // Define new offsets, sizes, and strides for new extractedSlice
   SmallVector<OpFoldResult, 3> newSliceOffsets = {
@@ -915,12 +1007,15 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
   if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
 
-  // Fix the inner conv op with packed input & filter
+  // Fix the uKernel after packing input & filter
   LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
 
-  LogicalResult result5 = multipacking_optimization(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result5)) return transformOp->emitError("failed to apply Multi-Packing optimization");
+  LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
+
+  LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))

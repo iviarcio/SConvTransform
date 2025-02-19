@@ -708,7 +708,7 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
     Value FhIndex = unpackedIndices[1];
     Value FwIndex = unpackedIndices[2];
 
-    Value kIndex = getConvolvedIndex(nestedBuilder, nestedLoc, index0, index2, res.k2);
+    Value kIndex = getConvolvedIndex(nestedBuilder, nestedLoc, index0, index2, Nf);
     SmallVector<Value> extractionIndices{kIndex, NcIndex, FhIndex, FwIndex};
 
     Value filterVal = nestedBuilder.create<tensor::ExtractOp>(loc, filterSlice, extractionIndices);
@@ -719,7 +719,7 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
   // to indexing the new filterSlice
   rewriter.setInsertionPointToStart(innerLoop.getBody());
   Value affineIndex = rewriter.create<AffineApplyOp>(
-      innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(res.k2), context), innerLoop.getInductionVar());
+      innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(Nf), context), innerLoop.getInductionVar());
 
   // Define new offsets, sizes, and strides for new extractedSlice
   SmallVector<OpFoldResult, 3> newSliceOffsets = {

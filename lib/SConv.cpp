@@ -160,6 +160,33 @@ static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
   return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
 }
 
+// Compute the input indices considering strides and tensor structure.
+static SmallVector<Value, 3> computeInputIndices(
+    OpBuilder &b, Location loc, Value nIndex, Value tIndex, Value kIndex,
+    Value nwinIndex, int64_t Tw, int64_t Fh, int64_t Fw, int64_t Nwin, 
+    SmallVector<int64_t, 2> strides) {
+
+  MLIRContext *context = b.getContext();
+  AffineExpr d0, d1, d2, d3;
+  bindDims(context, d0, d1, d2, d3);
+
+  //  NcIndex (iNc) = iK floorDiv (Fh * Fw)
+  AffineMap NcMap = AffineMap::get(4, 0, d2.floorDiv(Fh * Fw), context);
+  Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {nIndex, tIndex, kIndex, nwinIndex});
+
+  // ThIndex (iTh) = ((iT * Nwin * strides[1]) FlooDiv Tw) * strides[0] + (iK mod (Fh * Fw)) FloorDiv Fw
+  AffineMap ThMap = AffineMap::get(4, 0, 
+      ((d1 * Nwin * strides[1]).floorDiv(Tw)) * strides[0] + (d2 % (Fh * Fw)).floorDiv(Fw), context);
+  Value ThIndex = affine::makeComposedAffineApply(b, loc, ThMap, {nIndex, tIndex, kIndex, nwinIndex});
+
+  // TwIndex (iTw) = (iT * Nwin * strides[1]) mod Tw + iNwin * stride[1] + iK mod Fw
+  AffineMap TwMap = AffineMap::get(4, 0,
+      (d1 * Nwin * strides[1]) % Tw + d3 * strides[1] + d2 % Fw, context);
+  Value TwIndex = affine::makeComposedAffineApply(b, loc, TwMap, {nIndex, tIndex, kIndex, nwinIndex});
+
+  return {NcIndex, ThIndex, TwIndex};
+}
+
 // After the packing operations, the linalOps (uKernel) must be fixed to 
 // access the packed input & filter. Also, fix the iterator types & maps.
 static LogicalResult
@@ -636,8 +663,9 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
 
 // Pack multiple input tiles, adding another dimension to the packed tensor,
 // and skip K * Nwin elements per iteration on WS schedule.
-inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
-                     CSAStrategy res, SmallVector<Operation *> &tiledOps,
+static LogicalResult
+inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
+                     SmallVector<int64_t, 2> strides, SmallVector<Operation *> &tiledOps,
                      SmallVector<Operation *> loopOps) {
   if (res.schd != WS)
     return success();
@@ -654,7 +682,8 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   rewriter.setInsertionPoint(outerLoop);
 
   // First, find the input & filter extracted_slice in the nestLoop
-  Value inputSlice, filterSlice;
+  Value inputSlice;
+  Operation *filterSlice = nullptr;
   int count = 0;
   nestLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
     if (!inputSlice) {  // inputSlice is the first occurrence of ExtractSliceOp
@@ -689,6 +718,7 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   int64_t Fh = filterShape[2];
   int64_t Fw = filterShape[3];
   int64_t Nwin = Nw - Fw + 1;
+  int64_t Tw = 64; // TODO: Fix-me
   SmallVector<int64_t, 4> inputPackingShape = {Ni, Ti, Nc * Fh * Fw, Nwin};
   Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());
 
@@ -704,13 +734,18 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
     packingIndexingMaps,
     packingIterators,
     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-    Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0);
-    Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1);
-    Value index2 = nestedBuilder.create<linalg::IndexOp>(loc, 2);
-    Value index3 = nestedBuilder.create<linalg::IndexOp>(loc, 3);
+    Value iN = nestedBuilder.create<linalg::IndexOp>(loc, 0);
+    Value iT = nestedBuilder.create<linalg::IndexOp>(loc, 1);
+    Value iK = nestedBuilder.create<linalg::IndexOp>(loc, 2);
+    Value iNwin = nestedBuilder.create<linalg::IndexOp>(loc, 3);
 
-// TODO: extractionIndices
+    SmallVector<Value, 3> inputIndices = computeInputIndices(
+        nestedBuilder, nestedLoc, iN, iT, iK, iNwin, Tw, Fh, Fw, Nwin, strides);
+    Value iNc = inputIndices[0];
+    Value iTh = inputIndices[1];
+    Value iTw = inputIndices[2];
 
+    SmallVector<Value> extractionIndices{iN, iNc, iTh, iTw};
     Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, inputSlice, extractionIndices);
     nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
   });
@@ -719,13 +754,109 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   // to indexing the new inputSlice
   rewriter.setInsertionPointToStart(innerLoop.getBody());
   Value affineIndex = rewriter.create<AffineApplyOp>(
-      innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(Nc), context), innerLoop.getInductionVar());
+      innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(Nwin), context), innerLoop.getInductionVar());
  
-// TODO: Define new offsets, sizes, and strides for new extractedSlice
+  // Define new offsets, sizes, and strides for new extractedSlice
+  SmallVector<OpFoldResult, 4> newSliceOffsets = {
+      rewriter.getIndexAttr(0), affineIndex, rewriter.getIndexAttr(0), rewriter.getIndexAttr(0) };
+  SmallVector<OpFoldResult, 4> newSliceSizes = {
+      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(inputPackingShape[2]), rewriter.getIndexAttr(inputPackingShape[3]) };
+  SmallVector<OpFoldResult, 4> newSliceStrides = {
+      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1) };
 
-// TODO: Apply tensor.collapse_shape on the first two dimensions of new extractedSlice
+  Value updatedExtractedSlice = rewriter.create<tensor::ExtractSliceOp>(
+    innerLoop.getLoc(), newPackingTensor.getResult(0), newSliceOffsets, newSliceSizes, newSliceStrides);
 
-  return success;
+  // Apply tensor.collapse_shape on the first two dimensions of new extractedSlice
+  SmallVector<ReassociationIndices> collapseDims = {{0, 1}, {2}, {3}};
+  Value collapsedSlice = rewriter.create<tensor::CollapseShapeOp>(
+      innerLoop.getLoc(),
+      RankedTensorType::get({inputPackingShape[0], inputPackingShape[2], inputPackingShape[3]}, inputType.getElementType()),
+      updatedExtractedSlice,
+      collapseDims);
+
+  // Get the old uKernel & old inputPacking
+  linalg::GenericOp linalgOp;
+  linalg::GenericOp oInputPacking;
+  innerLoop.getBody()->walk([&](linalg::GenericOp op) {
+    if (!oInputPacking) {
+      oInputPacking = op; // Must be the first one
+    }
+    linalgOp = op; // It's the last one in the loop
+  });
+
+  // Set the insertion point to old uKernel
+  rewriter.setInsertionPoint(linalgOp);
+
+  auto linalgInputs = linalgOp.getInputs(); 
+  SmallVector<Value, 2> newInputs;
+  newInputs.push_back(collapsedSlice);  // Replace old inputPacking
+  newInputs.push_back(linalgInputs[1]); // Same filterPacking
+
+  // Get the indexingMaps of linalgOp
+  SmallVector<AffineMap, 3> indexingMaps;
+  if (auto indexingMapsAttr = linalgOp.getIndexingMaps()) {
+    for (auto attr : indexingMapsAttr) {
+      if (auto affineMapAttr = dyn_cast<AffineMapAttr>(attr)) {
+        indexingMaps.push_back(affineMapAttr.getValue());
+      } else {
+        return transformOp->emitError("Expected AffineMapAttr in indexingMaps.");
+      }
+    }
+  } else {
+    return transformOp->emitError("IndexingMaps not found on linalgOp.");
+  }
+
+  // Create the iterator types for new uKernel
+  auto reduction = utils::IteratorType::reduction; // parallel already defined
+  SmallVector<utils::IteratorType> iteratorTypes = {parallel, parallel, parallel, reduction};
+
+  // create the new uKernel
+  auto newLinalgOp = rewriter.create<linalg::GenericOp>(
+    linalgOp.getLoc(), linalgOp->getResultTypes(), 
+    newInputs, linalgOp.getOutputs(),
+    indexingMaps, iteratorTypes);
+
+  // clone the body of linalgOp into the new uKernel
+  rewriter.inlineRegionBefore(linalgOp.getRegion(), newLinalgOp.getRegion(),
+                              newLinalgOp.getRegion().begin());
+
+  // Replace all uses of the uKernel linalgOp to new uKernel
+  for (auto res : linalgOp.getResults()) {
+    res.replaceAllUsesWith(newLinalgOp.getResult(0));
+  }
+
+  // replace linalgOp with the new uKernel
+  rewriter.replaceOp(linalgOp, newLinalgOp->getResults());
+
+  Operation *emptyOp = nullptr;
+  innerLoop.getBody()->walk([&](tensor::EmptyOp op) {
+    emptyOp = op;
+  });
+
+  // Remove the obsolet ops
+  SmallVector<Operation *, 4> opsToRemove;
+  opsToRemove.push_back(emptyOp);
+  opsToRemove.push_back(extractedSlice); 
+  opsToRemove.push_back(oInputPacking);
+
+  for (Operation *op : llvm::reverse(opsToRemove)) {
+    if (op && op->use_empty()) {
+      rewriter.eraseOp(op);
+    }
+  }
+
+  auto convOp = tiledOps.front();
+  // Iterate through the tiledOps to find convOp and replace it to newLinalgOp
+  for (auto &op : tiledOps) {
+    if (op == convOp) {
+      op = newLinalgOp;
+      break;
+    }
+  }
+
+  return success();
+
 }
 
 // Pack multiple filter tiles adding a new dimension to the tensor k2 which
@@ -1014,7 +1145,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
 
-  LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
+  LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, res, strides, tiledOps, loopOps);
   if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
@@ -1124,7 +1255,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   CSAStrategy res = csa();
   
   /* Just for test */
-  // res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
+  res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
   // res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
   /* Comment the code above to use the CSA Analysis */
 

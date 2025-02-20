@@ -167,21 +167,21 @@ static SmallVector<Value, 3> computeInputIndices(
     SmallVector<int64_t, 2> strides) {
 
   MLIRContext *context = b.getContext();
-  AffineExpr d0, d1, d2, d3;
-  bindDims(context, d0, d1, d2, d3);
+  AffineExpr iN, iT, iK, iNwin;
+  bindDims(context, iN, iT, iK, iNwin);
 
   //  NcIndex (iNc) = iK floorDiv (Fh * Fw)
-  AffineMap NcMap = AffineMap::get(4, 0, d2.floorDiv(Fh * Fw), context);
+  AffineMap NcMap = AffineMap::get(4, 0, iK.floorDiv(Fh * Fw), context);
   Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {nIndex, tIndex, kIndex, nwinIndex});
 
   // ThIndex (iTh) = ((iT * Nwin * strides[1]) FlooDiv Tw) * strides[0] + (iK mod (Fh * Fw)) FloorDiv Fw
   AffineMap ThMap = AffineMap::get(4, 0, 
-      ((d1 * Nwin * strides[1]).floorDiv(Tw)) * strides[0] + (d2 % (Fh * Fw)).floorDiv(Fw), context);
+      ((iT * Nwin * strides[1]).floorDiv(Tw)) * strides[0] + (iK % (Fh * Fw)).floorDiv(Fw), context);
   Value ThIndex = affine::makeComposedAffineApply(b, loc, ThMap, {nIndex, tIndex, kIndex, nwinIndex});
 
   // TwIndex (iTw) = (iT * Nwin * strides[1]) mod Tw + iNwin * stride[1] + iK mod Fw
   AffineMap TwMap = AffineMap::get(4, 0,
-      (d1 * Nwin * strides[1]) % Tw + d3 * strides[1] + d2 % Fw, context);
+      (iT * Nwin * strides[1]) % Tw + iNwin * strides[1] + iK % Fw, context);
   Value TwIndex = affine::makeComposedAffineApply(b, loc, TwMap, {nIndex, tIndex, kIndex, nwinIndex});
 
   return {NcIndex, ThIndex, TwIndex};
@@ -834,9 +834,27 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, CSAStrategy
     emptyOp = op;
   });
 
+  // Locate the old affineApply operations within the inner loop body
+  Operation *affineApply1 = nullptr;
+  Operation *affineApply2 = nullptr;
+  Operation *affineApply3 = nullptr;
+  for (Operation &op : innerLoop.getBody()->getOperations()) {
+    if (!affineApply1 && isa<AffineApplyOp>(&op))
+      affineApply1 = &op; // It's the new AffineApply inserted 
+    else if (!affineApply2 && isa<AffineApplyOp>(&op))
+      affineApply2 = &op;
+    else if (!affineApply3 && isa<AffineApplyOp>(&op))
+      affineApply3 = &op;
+    // Stop once all target operations are found
+    if (affineApply1 && affineApply2 && affineApply3)
+      break;
+  }
+
   // Remove the obsolet ops
   SmallVector<Operation *, 4> opsToRemove;
   opsToRemove.push_back(emptyOp);
+  opsToRemove.push_back(affineApply2);
+  opsToRemove.push_back(affineApply3);
   opsToRemove.push_back(extractedSlice); 
   opsToRemove.push_back(oInputPacking);
 

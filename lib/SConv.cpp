@@ -682,7 +682,7 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, CSAStrategy
   rewriter.setInsertionPoint(outerLoop);
 
   // First, find the input & filter extracted_slice in the nestLoop
-  Value inputSlice;
+  Operation *inputSlice = nullptr;
   Operation *filterSlice = nullptr;
   int count = 0;
   nestLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
@@ -705,9 +705,12 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, CSAStrategy
 
   // Last, create the inputMultiPacking with shape {Ni, Ti, K, Nwin} 
   // where Ti = res.k2, K = Nc * Fh * Fw, Nwin = Nw - Fw + 1
-  auto input = extractedSlice->getResult(0);
+  auto input = inputSlice->getResult(0);
   auto inputType = cast<ShapedType>(input.getType());
   auto inputShape = inputType.getShape();
+  auto extracted = extractedSlice->getResult(0);
+  auto extractedType = cast<ShapedType>(extracted.getType());
+  auto extractedShape = extractedType.getShape();
   auto filter = filterSlice->getResult(0);
   auto filterType = cast<ShapedType>(filter.getType());
   auto filterShape = filterType.getShape();
@@ -717,8 +720,8 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, CSAStrategy
   int64_t Nw = inputShape[3];
   int64_t Fh = filterShape[2];
   int64_t Fw = filterShape[3];
-  int64_t Nwin = Nw - Fw + 1;
-  int64_t Tw = 64; // TODO: Fix-me
+  int64_t Nwin = extractedShape[3] - Fw + 1;
+  int64_t Tw = (Nw - 2) * (Fw / 2); // Tw = (colunas do tile do input)- 2 * (Fw / 2)
   SmallVector<int64_t, 4> inputPackingShape = {Ni, Ti, Nc * Fh * Fw, Nwin};
   Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());
 
@@ -746,7 +749,7 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, CSAStrategy
     Value iTw = inputIndices[2];
 
     SmallVector<Value> extractionIndices{iN, iNc, iTh, iTw};
-    Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, inputSlice, extractionIndices);
+    Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, inputSlice->getResult(0), extractionIndices);
     nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
   });
 

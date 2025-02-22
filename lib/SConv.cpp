@@ -160,8 +160,35 @@ static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
   return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
 }
 
-// After the packing operations, the linalOps (innermost conv) must be fixed to 
-// get the packed input & filter. Also, fix the iterator types & maps.
+// Compute the input indices considering strides and tensor structure.
+static SmallVector<Value, 3> computeInputIndices(
+    OpBuilder &b, Location loc, Value nIndex, Value tIndex, Value kIndex,
+    Value nwinIndex, int64_t Tw, int64_t Fh, int64_t Fw, int64_t Nwin, 
+    SmallVector<int64_t, 2> strides) {
+
+  MLIRContext *context = b.getContext();
+  AffineExpr iN, iT, iK, iNwin;
+  bindDims(context, iN, iT, iK, iNwin);
+
+  //  NcIndex (iNc) = iK floorDiv (Fh * Fw)
+  AffineMap NcMap = AffineMap::get(4, 0, iK.floorDiv(Fh * Fw), context);
+  Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {nIndex, tIndex, kIndex, nwinIndex});
+
+  // ThIndex (iTh) = ((iT * Nwin * strides[1]) FlooDiv Tw) * strides[0] + (iK mod (Fh * Fw)) FloorDiv Fw
+  AffineMap ThMap = AffineMap::get(4, 0, 
+      ((iT * Nwin * strides[1]).floorDiv(Tw)) * strides[0] + (iK % (Fh * Fw)).floorDiv(Fw), context);
+  Value ThIndex = affine::makeComposedAffineApply(b, loc, ThMap, {nIndex, tIndex, kIndex, nwinIndex});
+
+  // TwIndex (iTw) = (iT * Nwin * strides[1]) mod Tw + iNwin * stride[1] + iK mod Fw
+  AffineMap TwMap = AffineMap::get(4, 0,
+      (iT * Nwin * strides[1]) % Tw + iNwin * strides[1] + iK % Fw, context);
+  Value TwIndex = affine::makeComposedAffineApply(b, loc, TwMap, {nIndex, tIndex, kIndex, nwinIndex});
+
+  return {NcIndex, ThIndex, TwIndex};
+}
+
+// After the packing operations, the linalOps (uKernel) must be fixed to 
+// access the packed input & filter. Also, fix the iterator types & maps.
 static LogicalResult
 adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                 SmallVector<Operation *> &tiledOps, SmallVector<Operation *> loopOps) {
@@ -373,7 +400,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
 // Apply the filter packing. This packing will be inserted at the begining of first or
 // second loop level of the internal convolution depends of Input or Wheight Stationary
 static LogicalResult
-applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa, CSAStrategy res,
+applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                   SmallVector<Operation *> tiledOps, SmallVector<Operation *> loopOps) {
 
   MLIRContext *context = rewriter.getContext();
@@ -572,7 +599,8 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
   return success();
 }
 
-// Swap the inner loops when schedule is Input Stationary
+// Swap the inner loops when schedule is Input Stationary. Is there a bug on
+// scf::tileUsingSCF? innerInterchange has no effect!
 static LogicalResult
 swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                   SmallVector<Operation *> tiledOps, SmallVector<Operation *> &loopOps) {
@@ -633,15 +661,230 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
   return success();
 }
 
-// Apply a Multi-Packing Optimization.
-// Pack multiple (input) tiles, adding another dimension to the packed tensor,
-// and skip K * Nwin elements per iteration on WS. (TODO)
-// Pack multiple (filter) tiles adding a new dimension to the tensor k2 which
+// Pack multiple input tiles, adding another dimension to the packed tensor,
+// and skip K * Nwin elements per iteration on WS schedule.
+static LogicalResult
+inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
+                     CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides,
+                     SmallVector<Operation *> &tiledOps, SmallVector<Operation *> loopOps) {
+
+  if (res.schd != WS)
+    return success();
+
+  MLIRContext *context = rewriter.getContext();
+
+  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[5]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  if (!nestLoop || !outerLoop || !innerLoop)
+    return transformOp->emitError("Loops must be scf.for");
+
+  Location loc = outerLoop.getLoc();
+  rewriter.setInsertionPoint(outerLoop);
+
+  // First, find the input & filter extracted_slice in the nestLoop
+  Operation *inputSlice = nullptr;
+  Operation *filterSlice = nullptr;
+  int count = 0;
+  nestLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
+    if (!inputSlice) {  // inputSlice is the first occurrence of ExtractSliceOp
+      inputSlice = op;
+    }
+    if (count == 1) {  // filterSlice is the second occurence
+      filterSlice = op;
+    }
+    count++;
+  });
+
+  // Then, get the input extracted_slice used by the old inputPacking
+  Operation *extractedSlice = nullptr;
+  innerLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
+    if (!extractedSlice) { // It's the first one in the inner loop
+      extractedSlice = op;
+    }
+  });
+
+  // Last, create the inputMultiPacking with shape {Ni, Ti, K, Nwin} 
+  // where Ti = res.k2, K = Nc * Fh * Fw, Nwin = csa.mK_.nwindows
+  auto input = inputSlice->getResult(0);
+  auto inputType = cast<ShapedType>(input.getType());
+  auto inputShape = inputType.getShape();
+  auto filter = filterSlice->getResult(0);
+  auto filterType = cast<ShapedType>(filter.getType());
+  auto filterShape = filterType.getShape();
+  int64_t Ti = res.k2;          // num of tiles to the input 
+  int64_t Ni = inputShape[0];
+  int64_t Nc = inputShape[1];
+  int64_t Nw = inputShape[3];
+  int64_t Fh = filterShape[2];
+  int64_t Fw = filterShape[3];
+  int64_t Nwin = csa.mK_.nwindows;
+  int64_t Tw = (Nw - 2) * (Fw / 2); // Tw = (colunas do tile do input)- 2 * (Fw / 2)
+
+  SmallVector<int64_t, 4> inputPackingShape = {Ni, Ti, Nc * Fh * Fw, Nwin};
+  Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());
+
+  auto nloops = inputPackingShape.size();
+  auto parallel = utils::IteratorType::parallel;
+  SmallVector<utils::IteratorType, 4> packingIterators(nloops, parallel);
+  SmallVector<AffineMap, 4> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
+
+  auto newPackingTensor = rewriter.create<linalg::GenericOp>(
+    loc, inputPacking.getType(),
+    ValueRange{},
+    inputPacking,
+    packingIndexingMaps,
+    packingIterators,
+    [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+    Value iN = nestedBuilder.create<linalg::IndexOp>(loc, 0);
+    Value iT = nestedBuilder.create<linalg::IndexOp>(loc, 1);
+    Value iK = nestedBuilder.create<linalg::IndexOp>(loc, 2);
+    Value iNwin = nestedBuilder.create<linalg::IndexOp>(loc, 3);
+
+    SmallVector<Value, 3> inputIndices = computeInputIndices(
+        nestedBuilder, nestedLoc, iN, iT, iK, iNwin, Tw, Fh, Fw, Nwin, strides);
+    Value iNc = inputIndices[0];
+    Value iTh = inputIndices[1];
+    Value iTw = inputIndices[2];
+
+    SmallVector<Value> extractionIndices{iN, iNc, iTh, iTw};
+    Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, inputSlice->getResult(0), extractionIndices);
+    nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
+  });
+
+  // Create the affine.apply at beginning of innerLoop body
+  // to indexing the new inputSlice
+  rewriter.setInsertionPointToStart(innerLoop.getBody());
+  Value affineIndex = rewriter.create<AffineApplyOp>(
+      innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(Nwin), context), innerLoop.getInductionVar());
+ 
+  // Define new offsets, sizes, and strides for new extractedSlice
+  SmallVector<OpFoldResult, 4> newSliceOffsets = {
+      rewriter.getIndexAttr(0), affineIndex, rewriter.getIndexAttr(0), rewriter.getIndexAttr(0) };
+  SmallVector<OpFoldResult, 4> newSliceSizes = {
+      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(inputPackingShape[2]), rewriter.getIndexAttr(inputPackingShape[3]) };
+  SmallVector<OpFoldResult, 4> newSliceStrides = {
+      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1) };
+
+  Value updatedExtractedSlice = rewriter.create<tensor::ExtractSliceOp>(
+    innerLoop.getLoc(), newPackingTensor.getResult(0), newSliceOffsets, newSliceSizes, newSliceStrides);
+
+  // Apply tensor.collapse_shape on the first two dimensions of new extractedSlice
+  SmallVector<ReassociationIndices> collapseDims = {{0, 1}, {2}, {3}};
+  Value collapsedSlice = rewriter.create<tensor::CollapseShapeOp>(
+      innerLoop.getLoc(),
+      RankedTensorType::get({inputPackingShape[0], inputPackingShape[2], inputPackingShape[3]}, inputType.getElementType()),
+      updatedExtractedSlice,
+      collapseDims);
+
+  // Get the old uKernel & old inputPacking
+  linalg::GenericOp linalgOp;
+  linalg::GenericOp oInputPacking;
+  innerLoop.getBody()->walk([&](linalg::GenericOp op) {
+    if (!oInputPacking) {
+      oInputPacking = op; // Must be the first one
+    }
+    linalgOp = op; // It's the last one in the loop
+  });
+
+  // Set the insertion point to old uKernel
+  rewriter.setInsertionPoint(linalgOp);
+
+  auto linalgInputs = linalgOp.getInputs(); 
+  SmallVector<Value, 2> newInputs;
+  newInputs.push_back(collapsedSlice);  // Replace old inputPacking
+  newInputs.push_back(linalgInputs[1]); // Same filterPacking
+
+  // Get the indexingMaps of linalgOp
+  SmallVector<AffineMap, 3> indexingMaps;
+  if (auto indexingMapsAttr = linalgOp.getIndexingMaps()) {
+    for (auto attr : indexingMapsAttr) {
+      if (auto affineMapAttr = dyn_cast<AffineMapAttr>(attr)) {
+        indexingMaps.push_back(affineMapAttr.getValue());
+      } else {
+        return transformOp->emitError("Expected AffineMapAttr in indexingMaps.");
+      }
+    }
+  } else {
+    return transformOp->emitError("IndexingMaps not found on linalgOp.");
+  }
+
+  // Create the iterator types for new uKernel
+  auto reduction = utils::IteratorType::reduction; // parallel already defined
+  SmallVector<utils::IteratorType> iteratorTypes = {parallel, parallel, parallel, reduction};
+
+  // create the new uKernel
+  auto newLinalgOp = rewriter.create<linalg::GenericOp>(
+    linalgOp.getLoc(), linalgOp->getResultTypes(), 
+    newInputs, linalgOp.getOutputs(),
+    indexingMaps, iteratorTypes);
+
+  // clone the body of linalgOp into the new uKernel
+  rewriter.inlineRegionBefore(linalgOp.getRegion(), newLinalgOp.getRegion(),
+                              newLinalgOp.getRegion().begin());
+
+  // Replace all uses of the uKernel linalgOp to new uKernel
+  for (auto res : linalgOp.getResults()) {
+    res.replaceAllUsesWith(newLinalgOp.getResult(0));
+  }
+
+  // replace linalgOp with the new uKernel
+  rewriter.replaceOp(linalgOp, newLinalgOp->getResults());
+
+  Operation *emptyOp = nullptr;
+  innerLoop.getBody()->walk([&](tensor::EmptyOp op) {
+    emptyOp = op;
+  });
+
+  // Locate the old affineApply operations within the inner loop body
+  Operation *affineApply1 = nullptr;
+  Operation *affineApply2 = nullptr;
+  Operation *affineApply3 = nullptr;
+  for (Operation &op : innerLoop.getBody()->getOperations()) {
+    if (!affineApply1 && isa<AffineApplyOp>(&op))
+      affineApply1 = &op; // It's the new AffineApply inserted 
+    else if (!affineApply2 && isa<AffineApplyOp>(&op))
+      affineApply2 = &op;
+    else if (!affineApply3 && isa<AffineApplyOp>(&op))
+      affineApply3 = &op;
+    // Stop once all target operations are found
+    if (affineApply1 && affineApply2 && affineApply3)
+      break;
+  }
+
+  // Remove the obsolet ops
+  SmallVector<Operation *, 4> opsToRemove;
+  opsToRemove.push_back(emptyOp);
+  opsToRemove.push_back(affineApply2);
+  opsToRemove.push_back(affineApply3);
+  opsToRemove.push_back(extractedSlice); 
+  opsToRemove.push_back(oInputPacking);
+
+  for (Operation *op : llvm::reverse(opsToRemove)) {
+    if (op && op->use_empty()) {
+      rewriter.eraseOp(op);
+    }
+  }
+
+  auto convOp = tiledOps.front();
+  // Iterate through the tiledOps to find convOp and replace it to newLinalgOp
+  for (auto &op : tiledOps) {
+    if (op == convOp) {
+      op = newLinalgOp;
+      break;
+    }
+  }
+
+  return success();
+
+}
+
+// Pack multiple filter tiles adding a new dimension to the tensor k2 which
 // iterates over groups of Nf filters on IS.
 static LogicalResult
-multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
-                          CSAStrategy res, SmallVector<Operation *> &tiledOps,
-                          SmallVector<Operation *> loopOps) {
+filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
+                      CSAStrategy res, SmallVector<Operation *> &tiledOps,
+                      SmallVector<Operation *> loopOps) {
   if (res.schd != IS)
     return success();
 
@@ -666,7 +909,7 @@ multipacking_optimization(RewriterBase &rewriter, Operation *transformOp,
     count++;
   });
 
-  // Then, get the filter extracted_slice used by the old filerPacking
+  // Then, get the filter extracted_slice used by the old filterPacking
   Operation *extractedSlice = nullptr;
   innerLoop.getBody()->walk([&](tensor::ExtractSliceOp op) {
     if (!extractedSlice) { // It's the first one in the inner loop
@@ -839,16 +1082,16 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
     return transformOp->emitError("only TilingInterface ops are supported");
 
   // Assign tile sizes
-  // Input Stationary: N, NF * K2, NWIN * K3, NC, FH, FW  
-  // Weight Stationary: N, NF * K3, NWIN * K2, NC, FH, FW  
+  // Input Stationary: N, Nf * K2, Nwin * K3, Nc, Fh, Fw  
+  // Weight Stationary: N, Nf * K3, Nwin * K2, Nc, Fh, Fw  
   int64_t nFTiles = csa.mK_.num_filters * (res.schd == IS ? res.k2 : res.k3);
   int64_t nWinTiles = csa.mK_.nwindows * (res.schd == IS ? res.k3 : res.k2);
   SmallVector<int64_t, 6> tileSize = {1, nFTiles, nWinTiles, res.tile_c, 0, 0};
   SmallVector<OpFoldResult> tileSizesOfr = getAsIndexOpFoldResult(rewriter.getContext(), tileSize);
 
   // Order:
-  // Input Stationary: N, NC, NWIN, NF
-  // Weight Stationary: N, NC, NF, NWIN
+  // Input Stationary: N, Nc, Nwin, Nf
+  // Weight Stationary: N, Nc, Nf, Nwin
   int64_t outer = res.schd == IS ? 2 : 1;
   int64_t inner = res.schd == IS ? 1 : 2;
   SmallVector<int64_t, 4> tileInterchange = {0, 3, outer, inner};
@@ -908,19 +1151,22 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
 
   // Generate the filter packing
-  LogicalResult result2 = applyFilterPacking(rewriter, transformOp, csa, res, tiledOps, loopOps);
+  LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
 
   // Generate the input packing
   LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
   if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
 
-  // Fix the inner conv op with packed input & filter
+  // Fix the uKernel after packing input & filter
   LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
 
-  LogicalResult result5 = multipacking_optimization(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result5)) return transformOp->emitError("failed to apply Multi-Packing optimization");
+  LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
+
+  LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
+  if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
 
   transformResults.set(transformOp->getOpResult(0), tiledOps);
   for (auto [index, loop] : llvm::enumerate(loopOps))

@@ -599,8 +599,8 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
   return success();
 }
 
-// Swap the inner loops when schedule is Input Stationary. Is there a bug on
-// scf::tileUsingSCF? innerInterchange has no effect!
+// Swap the inner loops when schedule is Input Stationary. This is a workaround.
+// Apparently, scf::tileUsingSCF innerInterchange has no effect!
 static LogicalResult
 swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                   SmallVector<Operation *> tiledOps, SmallVector<Operation *> &loopOps) {
@@ -706,12 +706,18 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   // Last, create the inputMultiPacking with shape {Ni, Ti, K, Nwin} 
   // where Ti = res.k2, K = Nc * Fh * Fw, Nwin = csa.mK_.nwindows
+  
+  auto oper0Type = cast<ShapedType>(inputSlice->getOperand(0).getType());
+  auto oper0Shape = oper0Type.getShape(); // Used to do a workaround. See comment below
+
   auto input = inputSlice->getResult(0);
   auto inputType = cast<ShapedType>(input.getType());
   auto inputShape = inputType.getShape();
+
   auto filter = filterSlice->getResult(0);
   auto filterType = cast<ShapedType>(filter.getType());
   auto filterShape = filterType.getShape();
+
   int64_t Ti = res.k2;          // num of tiles to the input 
   int64_t Ni = inputShape[0];
   int64_t Nc = inputShape[1];
@@ -719,7 +725,11 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   int64_t Fh = filterShape[2];
   int64_t Fw = filterShape[3];
   int64_t Nwin = csa.mK_.nwindows;
-  int64_t Tw = (Nw - 2) * (Fw / 2); // Tw = (colunas do tile do input)- 2 * (Fw / 2)
+
+  // Tw = (colunas do tile do input) - 2 * (Fw / 2)
+  if (Nw == oper0Shape[3]-1) Nw++; // This is a workaround in Nw because the scf::tileUsingSCF is reducing
+                                   // 1 column from the tile compared to original tensor when stride == 2.
+  int64_t Tw = (Nw - 2) * (Fw / 2);
 
   SmallVector<int64_t, 4> inputPackingShape = {Ni, Ti, Nc * Fh * Fw, Nwin};
   Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());

@@ -154,7 +154,7 @@ static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
   strideExpr = b.getAffineConstantExpr(stride);
   
   // Create the affine map with both indices as inputs.
-  AffineMap convMap = AffineMap::get(2, 0, oExpr * strideExpr + fExpr, b.getContext());
+  AffineMap convMap = AffineMap::get(2, 0, {oExpr * strideExpr + fExpr}, b.getContext());
   
   // Apply the affine map to the provided indices.
   return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
@@ -171,17 +171,17 @@ static SmallVector<Value, 3> computeInputIndices(
   bindDims(context, iN, iT, iK, iNwin);
 
   //  NcIndex (iNc) = iK floorDiv (Fh * Fw)
-  AffineMap NcMap = AffineMap::get(4, 0, iK.floorDiv(Fh * Fw), context);
+  AffineMap NcMap = AffineMap::get(4, 0, {iK.floorDiv(Fh * Fw)}, context);
   Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {nIndex, tIndex, kIndex, nwinIndex});
 
   // ThIndex (iTh) = ((iT * Nwin * strides[1]) FlooDiv Tw) * strides[0] + (iK mod (Fh * Fw)) FloorDiv Fw
   AffineMap ThMap = AffineMap::get(4, 0, 
-      ((iT * Nwin * strides[1]).floorDiv(Tw)) * strides[0] + (iK % (Fh * Fw)).floorDiv(Fw), context);
+          {((iT * Nwin * strides[1]).floorDiv(Tw)) * strides[0] + (iK % (Fh * Fw)).floorDiv(Fw)}, context);
   Value ThIndex = affine::makeComposedAffineApply(b, loc, ThMap, {nIndex, tIndex, kIndex, nwinIndex});
 
   // TwIndex (iTw) = (iT * Nwin * strides[1]) mod Tw + iNwin * stride[1] + iK mod Fw
   AffineMap TwMap = AffineMap::get(4, 0,
-      (iT * Nwin * strides[1]) % Tw + iNwin * strides[1] + iK % Fw, context);
+          {(iT * Nwin * strides[1]) % Tw + iNwin * strides[1] + iK % Fw}, context);
   Value TwIndex = affine::makeComposedAffineApply(b, loc, TwMap, {nIndex, tIndex, kIndex, nwinIndex});
 
   return {NcIndex, ThIndex, TwIndex};
@@ -197,8 +197,8 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   MLIRContext *context = rewriter.getContext();
 
   // Validate input loops
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
   if (!outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -317,8 +317,8 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
                  CSAStrategy res, SmallVector<Operation *> loopOps) {
 
   // Validate input loops
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
   if (!outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -406,7 +406,7 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
   MLIRContext *context = rewriter.getContext();
 
   // select the loop based on IS or WS
-  int loopIndex = res.schd == IS ? 1 : 0;
+  int loopIndex = res.schd == IS ? 5 : 4;
 
   // Cast to scf::ForOp the  selected loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
@@ -501,7 +501,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
   MLIRContext *context = rewriter.getContext();
 
   // select the loop based on IS or WS
-  int loopIndex = res.schd == IS ? 0 : 1;
+  int loopIndex = res.schd == IS ? 4 : 5;
 
   // Cast to scf::ForOp the  selected loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
@@ -607,8 +607,8 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
 
   if (res.schd != IS) return success();
 
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
   if (!outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -673,9 +673,9 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   MLIRContext *context = rewriter.getContext();
 
-  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[5]);
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[3]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
   if (!nestLoop || !outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -900,9 +900,9 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   MLIRContext *context = rewriter.getContext();
 
-  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[5]);
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[1]);
+  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[3]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
   if (!nestLoop || !outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -1117,7 +1117,9 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
     return transformOp->emitError("failed the outermost tile operation");
 
   // Perform the replacement of tiled and fused values.
-  rewriter.replaceOp(tilingInterfaceOp, tiledResults->replacements);
+  rewriter.replaceOp(tilingInterfaceOp, tiledResults->loops.empty()
+                             ? tiledResults->tiledOps.front()->getResults()
+                             : tiledResults->loops.front()->getResults());
 
   // Perform the tiling in the inner convolution
   auto innerOp = tiledResults->tiledOps.front();
@@ -1143,13 +1145,15 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
     return transformOp->emitError("failed the innermost tile operation");
 
   // Perform the replacement of tiled and fused values.
-  rewriter.replaceOp(innerTilingInterfaceOp, innerTiledResults->replacements);
+  rewriter.replaceOp(innerTilingInterfaceOp, innerTiledResults->loops.empty()
+                             ? innerTiledResults->tiledOps.front()->getResults()
+                             : innerTiledResults->loops.front()->getResults());
 
   // Report back the relevant handles to the transform op.
   tiledOps.push_back(innerTiledResults->tiledOps.front());
-  for (Operation *loop : innerTiledResults->loops)
-    loopOps.push_back(loop);
   for (Operation *loop : tiledResults->loops)
+    loopOps.push_back(loop);
+  for (Operation *loop : innerTiledResults->loops)
     loopOps.push_back(loop);
 
   // Swap the innner loops in the case of Input Stationary
@@ -1172,9 +1176,11 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
 
+  // Generate the filter Multi-Packing
   LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
 
+  // Generate the input Multi-Packing
   LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
   if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
 

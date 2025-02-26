@@ -133,7 +133,7 @@ public:
     if (auto *ptr = handler.dyn_cast<mlir::SourceMgrDiagnosticHandler *>()) {
       delete ptr;
     } else {
-      delete handler.get<mlir::SourceMgrDiagnosticVerifierHandler *>();
+      delete cast<mlir::SourceMgrDiagnosticVerifierHandler *>(handler);
     }
   }
 
@@ -324,15 +324,6 @@ static llvm::LogicalResult runMain(int argc, char **argv) {
 
   mlir::registerAllPasses();
 
-  // // Register transform interpreter pass.
-  // mlir::transform::registerInterpreterPass();
-  //
-  // // Register a handful of cleanup passes that we can run to make the output
-  // // IR look nicer.
-  // mlir::registerCanonicalizerPass();
-  // mlir::registerCSEPass();
-  // mlir::registerSymbolDCEPass();
-  
   // Explicitly register the transform dialect. This is not strictly necessary
   // since it has been already registered as part of the upstream dialect list,
   // but useful for example purposes for cases when dialects to register are

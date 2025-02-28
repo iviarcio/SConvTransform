@@ -368,18 +368,18 @@ CSAStrategy CSA::operator()() {
   }
 }
 
-CSA createCSAPass(ConvInfo &conv) {
-  ArchInfo arch = {
-      (uint32_t)(32768 * 0.9),   /* 32KB */
-      (uint32_t)(1048576 * 0.9), /* 1MB */
-      (uint32_t)(4194304 * 0.9), /* 4MB */
-      2,                         /* Latency L1 */
-      10,                        /* Latency L2 */
-      30,                        /* Latency L3 */
-      300,                       /* Latency MEM */
-      128                        /* Cache Line Size */
-  };
-
-  mKInfo mK = {16, 8, 128};
+CSA createCSAPass(ArchInfo &arch, ConvInfo &conv, mKInfo &mK) {
+  // ArchInfo arch = {
+  //     (uint32_t)(32768 * 0.9),   /* 32KB */
+  //     (uint32_t)(1048576 * 0.9), /* 1MB */
+  //     (uint32_t)(4194304 * 0.9), /* 4MB */
+  //     2,                         /* Latency L1 */
+  //     10,                        /* Latency L2 */
+  //     30,                        /* Latency L3 */
+  //     300,                       /* Latency MEM */
+  //     128                        /* Cache Line Size */
+  // };
+  //
+  // mKInfo mK = {16, 8, 128};
   return CSA(arch, conv, mK);
 }

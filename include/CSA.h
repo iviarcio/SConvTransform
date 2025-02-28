@@ -54,6 +54,6 @@ public:
   mKInfo mK_;
 };
 
-CSA createCSAPass(ConvInfo &conv);
+CSA createCSAPass(ArchInfo &arch, ConvInfo &conv, mKInfo &mK);
 
 #endif

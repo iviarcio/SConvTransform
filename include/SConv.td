@@ -44,18 +44,29 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
     based on vector-register shift instructions for convolutions with unitary stride.
   }];
 
-  // The argument include the handle to the payload operation.
+  // The argument include the handle to the payload operation, with optional mK_info, 
+  // and arch_info configurations:
+  //   mK_info = { nwindows, num_filters, noutput }
+  //   arch_info = { l1size, l2size, l3size, l1_latency, l2_latency, l3_latency, mem_latency, cache_line }
+
   // The handle must implement TransformHandleTypeInterface.   
-  let arguments = (ins TransformHandleTypeInterface:$target);
 
-  let results = (outs TransformHandleTypeInterface:$transformed,
-                      Variadic<TransformHandleTypeInterface>:$loops);
+  let arguments = (ins
+    TransformHandleTypeInterface:$target,
+    OptionalAttr<ArrayAttr>:$mK_info,
+    OptionalAttr<ArrayAttr>:$arch_info
+  );
 
-  let assemblyFormat = [{
-    $target
-    attr-dict
-    `:` functional-type(operands, results)
-  }];
+  let results = (outs
+    TransformHandleTypeInterface:$transformed_op,
+    Variadic<TransformHandleTypeInterface>:$loops
+  );
+
+  // let assemblyFormat = "$target `:` type($target) type($transformed_op) type($loops) attr-dict (`mK_info` `=` $mK_info^ (`,` `arch_info` `=` $arch_info^)?)?";
+
+  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
+
+  let hasVerifier = 1;
 
 }
 

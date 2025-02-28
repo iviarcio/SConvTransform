@@ -1209,6 +1209,64 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   if (!convOp)  
     return emitSilenceableError() << "expected a Conv2DNchwFchwOp for transformation";
 
+  // Initialize the default values of mKInfo & ArchInfo to the CSA Analysis.
+  // It's dependent of the target machine. Use these values for the cluster Sorgan
+  mKInfo mK = {16, 8, 128};
+  ArchInfo arch = {
+      (uint32_t)(32768 * 0.9),
+      (uint32_t)(1048576 * 0.9),
+      (uint32_t)(4194304 * 0.9),
+      2, 10, 30, 300, 128
+  };
+
+  // Get the optional arguments
+  auto mKInfoAttr = getMKInfo();
+  auto archInfoAttr = getArchInfo();
+
+  // If `mKInfoAttr` was provided, use the given values
+  if (mKInfoAttr) {
+    SmallVector<int64_t, 4> mKValues;
+    for (auto attr : mKInfoAttr->getValue()) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
+        mKValues.push_back(intAttr.getInt());
+      } else {
+        return emitSilenceableError() << "Error: mKInfoAttr contains non-integer values!\n";
+      }
+    }
+    if (mKValues.size() >= 3) {
+      mK.nwindows = mKValues[0];
+      mK.num_filters = mKValues[1];
+      mK.noutput = mKValues[2];
+    } else {
+      return emitSilenceableError() << "Error: mKInfoAttr does not contain enough values!\n";
+    }
+  }
+
+  // If `archInfoAttr` was provided, use the given values
+  if (archInfoAttr) {
+    SmallVector<int64_t, 4> archValues;
+    for (auto attr : archInfoAttr->getValue()) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
+        archValues.push_back(intAttr.getInt());
+      } else {
+        return emitSilenceableError() << "Error: archInfoAttr contains non-integer values!\n";
+      }
+    }
+    if (archValues.size() >=8) {
+      arch.l1_size = (uint32_t)(archValues[0] * 0.9);
+      arch.l2_size = (uint32_t)(archValues[1] * 0.9);
+      arch.l3_size = (uint32_t)(archValues[2] * 0.9);
+      arch.l1_latency = archValues[3];
+      arch.l2_latency = archValues[4];
+      arch.l3_latency = archValues[5];
+      arch.mem_latency = archValues[6];
+      arch.cache_line = archValues[7];
+    } else {
+      return emitSilenceableError() << "Error: archInfoAttr does not contain enough values!\n";
+    }
+  }
+
+  // Starting generalize the named convolution
   rewriter.setInsertionPoint(convOp);
   Location loc = convOp.getLoc();
 
@@ -1287,7 +1345,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
 
   // Call the CSA Analysis
   ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};
-  CSA csa = createCSAPass(csaConv);
+  CSA csa = createCSAPass(arch, csaConv, mK);
   CSAStrategy res = csa();
   
   /* Just for test */
@@ -1306,6 +1364,12 @@ void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstanc
   consumesHandle(getTargetMutable(), effects);
   producesHandle(getOperation()->getOpResults(), effects);
   modifiesPayload(effects);
+}
+
+LogicalResult
+transform::SConvOp::verify() {
+  // All necessary checks are done in the Apply
+  return success();
 }
 
 void registerSConv(mlir::DialectRegistry &registry) {

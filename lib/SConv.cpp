@@ -1222,6 +1222,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
   // Get the optional arguments
   auto mKInfoAttr = getMKInfo();
   auto archInfoAttr = getArchInfo();
+  auto latencyAttr = getLatency();
 
   // If `mKInfoAttr` was provided, use the given values
   if (mKInfoAttr) {
@@ -1233,10 +1234,10 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         return emitSilenceableError() << "Error: mKInfoAttr contains non-integer values!\n";
       }
     }
-    if (mKValues.size() >= 3) {
+    if (mKValues.size() >= 2) {
       mK.nwindows = mKValues[0];
       mK.num_filters = mKValues[1];
-      mK.noutput = mKValues[2];
+      mK.noutput = mK.nwindows * mK.num_filters;
     } else {
       return emitSilenceableError() << "Error: mKInfoAttr does not contain enough values!\n";
     }
@@ -1252,17 +1253,33 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         return emitSilenceableError() << "Error: archInfoAttr contains non-integer values!\n";
       }
     }
-    if (archValues.size() >=8) {
+    if (archValues.size() >=4) {
       arch.l1_size = (uint32_t)(archValues[0] * 0.9);
       arch.l2_size = (uint32_t)(archValues[1] * 0.9);
       arch.l3_size = (uint32_t)(archValues[2] * 0.9);
-      arch.l1_latency = archValues[3];
-      arch.l2_latency = archValues[4];
-      arch.l3_latency = archValues[5];
-      arch.mem_latency = archValues[6];
-      arch.cache_line = archValues[7];
+      arch.cache_line = archValues[3];
     } else {
       return emitSilenceableError() << "Error: archInfoAttr does not contain enough values!\n";
+    }
+  }
+
+  // If `latencyAttr` was provided, use the given values
+  if (latencyAttr) {
+    SmallVector<int64_t, 4> latencyValues;
+    for (auto attr : latencyAttr->getValue()) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
+        latencyValues.push_back(intAttr.getInt());
+      } else {
+        return emitSilenceableError() << "Error: latencyAttr contains non-integer values!\n";
+      }
+    }
+    if (latencyValues.size() >=4) {
+      arch.l1_latency = latencyValues[0];
+      arch.l2_latency = latencyValues[1];
+      arch.l3_latency = latencyValues[2];
+      arch.mem_latency = latencyValues[3];
+    } else {
+      return emitSilenceableError() << "Error: latencyAttr does not contain enough values!\n";
     }
   }
 

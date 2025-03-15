@@ -45,24 +45,24 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
   }];
 
   // The argument include the handle to the payload operation, with optional mK_info, 
-  // and arch_info configurations:
-  //   mK_info = { nwindows, num_filters, noutput }
-  //   arch_info = { l1size, l2size, l3size, l1_latency, l2_latency, l3_latency, mem_latency, cache_line }
+  // arch_info & latency configurations:
+  //   mK_info = { nwindows, num_filters }
+  //   arch_info = { l1size, l2size, l3size, cache_line }
+  //   latency = { l1_latency, l2_latency, l3_latency, mem_latency }
 
   // The handle must implement TransformHandleTypeInterface.   
 
   let arguments = (ins
     TransformHandleTypeInterface:$target,
     OptionalAttr<ArrayAttr>:$mK_info,
-    OptionalAttr<ArrayAttr>:$arch_info
+    OptionalAttr<ArrayAttr>:$arch_info,
+    OptionalAttr<ArrayAttr>:$latency
   );
 
   let results = (outs
     TransformHandleTypeInterface:$transformed_op,
     Variadic<TransformHandleTypeInterface>:$loops
   );
-
-  // let assemblyFormat = "$target `:` type($target) type($transformed_op) type($loops) attr-dict (`mK_info` `=` $mK_info^ (`,` `arch_info` `=` $arch_info^)?)?";
 
   let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
 

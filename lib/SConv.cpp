@@ -1082,7 +1082,7 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 static LogicalResult
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
             CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, 
-            transform::TransformResults &transformResults) {
+            SmallVector<Operation*, 7> &outResults) {
 
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> loopOps;
@@ -1184,9 +1184,10 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
   if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
 
-  transformResults.set(transformOp->getOpResult(0), tiledOps);
-  for (auto [index, loop] : llvm::enumerate(loopOps))
-    transformResults.set(transformOp->getOpResult(index + 1), {loop});
+  // Store the results (Operation*) in the output variable (as Value)
+  outResults.push_back(tiledOps.front());  // The head is the linalg.generic (uKernel)
+  for (auto &loop : loopOps)
+    outResults.push_back(loop);  // The tail is the loops
 
   return success();
 }
@@ -1199,18 +1200,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
                           transform::TransformResults &results,
                           transform::TransformState &state) {
 
-  // Get context and convOp params
-  MLIRContext *context = rewriter.getContext();
-  auto targetOps = state.getPayloadOps(getTarget());
-
-  assert(llvm::hasSingleElement(targetOps) && "expected a single target op");
-
-  auto convOp = dyn_cast_or_null<linalg::Conv2DNchwFchwOp>(*targetOps.begin());
-  if (!convOp)  
-    return emitSilenceableError() << "expected a Conv2DNchwFchwOp for transformation";
-
   // Initialize the default values of mKInfo & ArchInfo to the CSA Analysis.
-  // It's dependent of the target machine. Use these values for the cluster Sorgan
+  // It's dependent of the target machine. We used these values for Sorgan
   mKInfo mK = {16, 8, 128};
   ArchInfo arch = {
       (uint32_t)(32768 * 0.9),
@@ -1283,98 +1274,135 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     }
   }
 
-  // Starting generalize the named convolution
-  rewriter.setInsertionPoint(convOp);
-  Location loc = convOp.getLoc();
+  // temporary variables to store all conv transformation
+  SmallVector<Operation*> tempResultConvs;
+  SmallVector<SmallVector<Operation*, 6>> tempResultLoops;
 
-  SmallVector<Value> inputs = convOp.getDpsInputs();
-  ValueRange outputs = convOp.getDpsInits();
-  Value input = inputs[0];
-  Value filter = inputs[1];
-  Value output = outputs[0];
+  // Get context and convOps
+  MLIRContext *context = rewriter.getContext();
+  auto targetOps = state.getPayloadOps(getTarget());
 
-  auto inputType = cast<ShapedType>(input.getType());
-  auto filterType = cast<ShapedType>(filter.getType());
-  auto outputType = cast<ShapedType>(output.getType());
+  for (Operation *targetOp : targetOps) {
+    auto convOp = dyn_cast_or_null<linalg::Conv2DNchwFchwOp>(targetOp);
+    if (!convOp)
+      continue;  // expected only Conv2DNchwFchw convolutions for transformations
 
-  if (!filterType.hasStaticShape())
-    return emitSilenceableError() << "expected a static shape for the filter";
+    // Starting generalize the named convolution
+    rewriter.setInsertionPoint(convOp);
+    Location loc = convOp.getLoc();
 
-  if (!inputType.hasStaticShape())
-    return emitSilenceableError() << "expected a static shape for the input";
+    SmallVector<Value> inputs = convOp.getDpsInputs();
+    ValueRange outputs = convOp.getDpsInits();
+    Value input = inputs[0];
+    Value filter = inputs[1];
+    Value output = outputs[0];
 
-  // Does not support dilation.
-  if (!hasAllOneValues(convOp.getDilations()))
-    return emitSilenceableError() << "expected all ones for dilations";
+    auto inputType = cast<ShapedType>(input.getType());
+    auto filterType = cast<ShapedType>(filter.getType());
+    auto outputType = cast<ShapedType>(output.getType());
 
-  auto inputShape = inputType.getShape();
-  auto filterShape = filterType.getShape();
-  auto outputShape = outputType.getShape();
-  int64_t n = outputShape[0];
-  int64_t ic = inputShape[1];
-  int64_t fh = filterShape[2];
-  int64_t fw = filterShape[3];
-  int64_t oc = outputShape[1];
-  int64_t oh = outputShape[2];
-  int64_t ow = outputShape[3];
+    if (!filterType.hasStaticShape())
+      return emitSilenceableError() << "expected a static shape for the filter";
 
-  // Create the Collapse shape to be inserted at begining
-  SmallVector<ReassociationIndices> outputReassocIndices = {{0}, {1}, {2, 3}};
-  auto reshapedOutputType = RankedTensorType::get({n, oc, oh * ow}, outputType.getElementType());
-  Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
-      loc, reshapedOutputType, output, outputReassocIndices);
+    if (!inputType.hasStaticShape())
+      return emitSilenceableError() << "expected a static shape for the input";
 
-  // Create the affine maps, iterator types and output tensor shape
-  auto parallel = utils::IteratorType::parallel;
-  auto reduction = utils::IteratorType::reduction;
-  SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
+    // Does not support dilation.
+    if (!hasAllOneValues(convOp.getDilations()))
+      return emitSilenceableError() << "expected all ones for dilations";
 
-  // Get strides
-  auto hstride = convOp.getStrides().getValues<int64_t>()[0];
-  auto wstride = convOp.getStrides().getValues<int64_t>()[1];
-  SmallVector<int64_t, 2> strides = {hstride, wstride};
+    auto inputShape = inputType.getShape();
+    auto filterShape = filterType.getShape();
+    auto outputShape = outputType.getShape();
+    int64_t n = outputShape[0];
+    int64_t ic = inputShape[1];
+    int64_t fh = filterShape[2];
+    int64_t fw = filterShape[3];
+    int64_t oc = outputShape[1];
+    int64_t oh = outputShape[2];
+    int64_t ow = outputShape[3];
 
-  AffineExpr d0, d1, d2, d3, d4, d5;
-  bindDims(context, d0, d1, d2, d3, d4, d5);
-  auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) * hstride + d4, d2 % oh * wstride + d5}, context);
-  auto rhsMap = AffineMap::get(6, 0, {d1, d3, d4, d5}, context);
-  auto resultMap = AffineMap::get(6, 0, {d0, d1, d2}, context);
+    // Create the Collapse shape to be inserted at begining
+    SmallVector<ReassociationIndices> outputReassocIndices = {{0}, {1}, {2, 3}};
+    auto reshapedOutputType = RankedTensorType::get({n, oc, oh * ow}, outputType.getElementType());
+    Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
+        loc, reshapedOutputType, output, outputReassocIndices);
 
-  // Create the new genericOp that replaces the named convolution
-  auto genericOp = rewriter.create<linalg::GenericOp>(
-      loc,
-      reshapedOutputType,
-      inputs,
-      ValueRange{reshapedOutput},
-      ArrayRef<AffineMap>{lhsMap, rhsMap, resultMap},
-      newOpIterators,
-      [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-        Value mul = createMul(loc, args[0], args[1], args[2].getType(), nestedBuilder);
-        Value add = createAdd(loc, mul, args[2], nestedBuilder);
-        nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
-      });
+    // Create the affine maps, iterator types and output tensor shape
+    auto parallel = utils::IteratorType::parallel;
+    auto reduction = utils::IteratorType::reduction;
+    SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
 
-  // Create the Expanded Shape
-  auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
+    // Get strides
+    auto hstride = convOp.getStrides().getValues<int64_t>()[0];
+    auto wstride = convOp.getStrides().getValues<int64_t>()[1];
+    SmallVector<int64_t, 2> strides = {hstride, wstride};
 
-  // replace convOp with (reshapedOutput + genericOp + reshapedResult)
-  rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
+    AffineExpr d0, d1, d2, d3, d4, d5;
+    bindDims(context, d0, d1, d2, d3, d4, d5);
+    auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) * hstride + d4, d2 % oh * wstride + d5}, context);
+    auto rhsMap = AffineMap::get(6, 0, {d1, d3, d4, d5}, context);
+    auto resultMap = AffineMap::get(6, 0, {d0, d1, d2}, context);
 
-  // Call the CSA Analysis
-  ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};
-  CSA csa = createCSAPass(arch, csaConv, mK);
-  CSAStrategy res = csa();
-  
-  /* Just for test */
-  // res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
-  // res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
-  /* Comment the code above to use the CSA Analysis */
+    // Create the new genericOp that replaces the named convolution
+    auto genericOp = rewriter.create<linalg::GenericOp>(
+        loc,
+        reshapedOutputType,
+        inputs,
+        ValueRange{reshapedOutput},
+        ArrayRef<AffineMap>{lhsMap, rhsMap, resultMap},
+        newOpIterators,
+        [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+          Value mul = createMul(loc, args[0], args[1], args[2].getType(), nestedBuilder);
+          Value add = createAdd(loc, mul, args[2], nestedBuilder);
+          nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
+        });
 
-  // Apply the tile in the genericOp based on the CSA Analysis
-  LogicalResult result = applyTileTo(rewriter, getOperation(), genericOp, csa, res, strides, results);
+    // Create the Expanded Shape
+    auto reshapedResult = rewriter.create<tensor::ExpandShapeOp>(loc, outputType, genericOp.getResults().front(), outputReassocIndices);
 
-  return failed(result) ? DiagnosedSilenceableFailure::definiteFailure()
-                        : DiagnosedSilenceableFailure::success();
+    // replace convOp with (reshapedOutput + genericOp + reshapedResult)
+    rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
+
+    // Call the CSA Analysis
+    ConvInfo csaConv = {ic, oh, ow, fh, fw, oc, 4};
+    CSA csa = createCSAPass(arch, csaConv, mK);
+    CSAStrategy res = csa();
+    
+    /* Just for test */
+    // res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
+    // res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
+    /* Comment the code above to use the CSA Analysis */
+
+    // Apply the tile in the genericOp based on the CSA Analysis
+    SmallVector<Operation*, 7> localResults;
+    LogicalResult result = applyTileTo(rewriter, getOperation(), genericOp, csa, res, strides, localResults);
+
+    if (failed(result))
+      return emitSilenceableError() << "Failed to apply tiling to one of the convolution operations";
+
+    // The first result is the transformed linalg.generic (uKernel)
+    tempResultConvs.push_back(localResults[0]);
+
+    // Following, the generated loops
+    SmallVector<Operation*, 6> loopSet;
+    for (int i = 1; i <= 6; ++i)
+      loopSet.push_back(localResults[i]);
+
+    tempResultLoops.push_back(loopSet);
+  }
+
+  // Flatten tempResultLoops
+  SmallVector<Operation*> flatResultLoops;
+  for (const auto &loopSet : tempResultLoops) {
+    flatResultLoops.append(loopSet.begin(), loopSet.end());
+  }
+
+  // Store results properly in TransformResults
+  results.set(getOperation()->getOpResult(0), tempResultConvs);
+  results.set(getOperation()->getOpResult(1), flatResultLoops);
+
+  return DiagnosedSilenceableFailure::success();
 }
 
 void transform::SConvOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

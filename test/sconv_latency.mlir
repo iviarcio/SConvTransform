@@ -1,0 +1,18 @@
+module attributes {transform.with_named_sequence} {
+
+  transform.named_sequence @__transform_main(
+    %arg0: !transform.any_op) {
+    %conv = transform.structured.match ops{["linalg.conv_2d_nchw_fchw"]} in %arg0
+      : (!transform.any_op) -> !transform.op<"linalg.conv_2d_nchw_fchw">
+
+    %res, %loops:6 = transform.structured.sconv %conv
+      { mK_info = [16, 8, 128] ,
+        arch_info = [ 32768, 1048576, 4194304, 128 ] ,
+        latency = [ 2, 10, 30, 300 ] }
+      : (!transform.op<"linalg.conv_2d_nchw_fchw">)
+      -> (!transform.op<"linalg.generic">, !transform.any_op, !transform.any_op,
+          !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+  
+    transform.yield
+  }
+}

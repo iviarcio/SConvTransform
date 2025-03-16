@@ -27,8 +27,7 @@ include "mlir/IR/RegionKindInterface.td"
 // extension, "structured.". The full op name will be further prefixed with "transform.".
 def SConvOp : Op<Transform_Dialect, "structured.sconv",
        [DeclareOpInterfaceMethods<TransformOpInterface>,
-        DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-        ReportTrackingListenerFailuresOpTrait]> {
+        DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
 
   // Provide a brief and a full description of SConvOp. It is recommended describing 
   // the effects on the operands and how the operation processes various failure modes.
@@ -38,10 +37,8 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
     toolchain that can be integrated into machine-learning compilers.
     This algorithm introduces: (a) Convolution Slicing Analysis (CSA) — a convolution-
     specific 3D cache-blocking analysis pass that focuses on tile reuse over the cache
-    hierarchy; (b) Convolution Slicing Optimization (CSO) — a code-generation pass that
-    uses CSA to generate a tiled direct-convolution macro-kernel; and (c) Vector-Based
-    Packing (VBP) — an architecture-specific optimized input-tensor packing solution
-    based on vector-register shift instructions for convolutions with unitary stride.
+    hierarchy; and (b) Convolution Slicing Optimization (CSO) — a transform pass that
+    uses CSA to generate a tiled and packed direct-convolution micro-kernel.
   }];
 
   // The argument include the handle to the payload operation, with optional mK_info, 
@@ -60,8 +57,8 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
   );
 
   let results = (outs
-    TransformHandleTypeInterface:$transformed_op,
-    Variadic<TransformHandleTypeInterface>:$loops
+    TransformHandleTypeInterface:$output_convs,     // container of uKernels
+    Variadic<TransformHandleTypeInterface>:$loops   // container of associated loops
   );
 
   let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";

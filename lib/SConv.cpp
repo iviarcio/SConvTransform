@@ -1192,6 +1192,143 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   return success();
 }
 
+/// Splits a linalg.generic op along a given dimension by generating two
+/// tensor.extract_slice ops for each operand and cloning the genericOp
+/// with the respective slices.
+/// This assumes the dimension is splittable (bounds checked externally).
+static FailureOr<std::pair<linalg::GenericOp, linalg::GenericOp>>
+splitLinalgGenericOpAlongDim(RewriterBase &rewriter, linalg::GenericOp genericOp,
+                              int64_t splitDim, int64_t splitPoint) {
+
+  Location loc = genericOp.getLoc();
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPoint(genericOp);
+
+  SmallVector<Value> lowerOperands, upperOperands;
+
+  for (OpOperand &operand : genericOp->getOpOperands()) {
+    auto tensor = operand.get();
+    auto rankedType = dyn_cast<RankedTensorType>(tensor.getType());
+    if (!rankedType || splitDim >= rankedType.getRank())
+      return rewriter.notifyMatchFailure(genericOp, "Invalid operand for splitting");
+
+    // Prepare offsets and sizes for lower slice
+    SmallVector<Value> offsetsLow, sizesLow, strides;
+    SmallVector<Value> offsetsHigh, sizesHigh;
+
+    for (int64_t i = 0; i < rankedType.getRank(); ++i) {
+      Value dimSize = rewriter.create<tensor::DimOp>(loc, tensor, i);
+      Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      Value cSplit = rewriter.create<arith::ConstantIndexOp>(loc, splitPoint);
+
+      strides.push_back(c1);
+
+      if (i == splitDim) {
+        // Lower slice: offset = 0, size = splitPoint
+        offsetsLow.push_back(c0);
+        sizesLow.push_back(cSplit);
+
+        // Upper slice: offset = splitPoint, size = dimSize - splitPoint
+        offsetsHigh.push_back(cSplit);
+        sizesHigh.push_back(
+          rewriter.create<arith::SubIOp>(loc, dimSize, cSplit));
+      } else {
+        offsetsLow.push_back(c0);
+        sizesLow.push_back(dimSize);
+        offsetsHigh.push_back(c0);
+        sizesHigh.push_back(dimSize);
+      }
+    }
+
+    // Create slices
+    Value lowerSlice = rewriter.create<tensor::ExtractSliceOp>(
+        loc, tensor, offsetsLow, sizesLow, strides);
+    Value upperSlice = rewriter.create<tensor::ExtractSliceOp>(
+        loc, tensor, offsetsHigh, sizesHigh, strides);
+
+    lowerOperands.push_back(lowerSlice);
+    upperOperands.push_back(upperSlice);
+  }
+
+  // Clone original operation for lower slice
+  auto lowerGeneric = cast<linalg::GenericOp>(rewriter.clone(*genericOp.getOperation()));
+  for (auto [i, val] : llvm::enumerate(lowerOperands))
+    lowerGeneric->getOpOperand(i).set(val);
+
+  // Clone original operation for upper slice
+  auto upperGeneric = cast<linalg::GenericOp>(rewriter.clone(*genericOp.getOperation()));
+  for (auto [i, val] : llvm::enumerate(upperOperands))
+    upperGeneric->getOpOperand(i).set(val);
+
+  return std::make_pair(lowerGeneric, upperGeneric);
+}
+
+/// This function will be called when the convolution needs to be split.
+/// It takes the original convolution (`genericOp`), performs the split, and then applies tiling.
+static LogicalResult
+splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, linalg::GenericOp genericOp,
+                        CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides,
+                        SmallVector<SmallVector<Operation*, 6>> &resultLoops,
+                        SmallVector<Operation*> &resultConvs) {
+
+  MLIRContext *context = rewriter.getContext();
+  Location loc = genericOp.getLoc();
+
+  // Define the dimension & tile sizes
+  CSAStrategy split_res = res;
+  int64_t splitDim;
+  int64_t tileSize;
+  if (res.extra_k2 != 0) {
+    splitDim = res.schd == WS ? 2 : 1;
+    tileSize = res.k2;
+    split_res.k2 = res.extra_k2;
+  }
+  else if (res.extra_k3 != 0) {
+    splitDim = res.schd == IS ? 2 : 1;
+    tileSize = res.k3;
+    split_res.k3 = res.extra_k3;
+  }
+  else if (res.extra_tile_c !=0) {
+    splitDim = 3;
+    tileSize = res.tile_c;
+    split_res.tile_c = res.extra_tile_c;
+  }
+
+  FailureOr<std::pair<linalg::GenericOp, linalg::GenericOp>> splitOps =
+      splitLinalgGenericOpAlongDim(rewriter, genericOp, splitDim, tileSize);
+
+  if (failed(splitOps)) {
+    return transformOp->emitError("Failed to split linalg.generic operation programmatically.");
+  }
+
+  linalg::GenericOp lowerOp = splitOps->first;
+  linalg::GenericOp upperOp = splitOps->second;
+
+  // Apply the tiling for each split
+  SmallVector<Operation*, 7> firstResults, secondResults;
+  
+  rewriter.setInsertionPoint(genericOp);
+  if (failed(applyTileTo(rewriter, transformOp, lowerOp, csa, res, strides, firstResults)) ||
+      failed(applyTileTo(rewriter, transformOp, upperOp, csa, split_res, strides, secondResults))) {
+    return transformOp->emitError("Failed to apply tiling after split the convolution.");
+  }
+
+  resultConvs.push_back(firstResults[0]);
+  resultConvs.push_back(secondResults[0]);
+
+  SmallVector<Operation*, 6> firstLoopSet;
+  SmallVector<Operation*, 6> secondLoopSet;
+  for (int i = 1; i <= 6; ++i) {
+    firstLoopSet.push_back(firstResults[i]);
+    secondLoopSet.push_back(secondResults[i]);
+  }
+  resultLoops.push_back(firstLoopSet);
+  resultLoops.push_back(secondLoopSet);
+
+  return success();
+}
+
 ///
 /// Implementation of SConv::apply transform dialect operation.
 ///
@@ -1369,27 +1506,24 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     CSA csa = createCSAPass(arch, csaConv, mK);
     CSAStrategy res = csa();
     
-    /* Just for test */
-    // res.schd = WS; res.k2 = 2; res.k3 = 8; res.tile_c = 16;
-    // res.schd = IS; res.k2 = 8; res.k3 = 2; res.tile_c = 16;
-    /* Comment the code above to use the CSA Analysis */
-
-    // Apply the tile in the genericOp based on the CSA Analysis
-    SmallVector<Operation*, 7> localResults;
-    LogicalResult result = applyTileTo(rewriter, getOperation(), genericOp, csa, res, strides, localResults);
-
-    if (failed(result))
-      return emitSilenceableError() << "Failed to apply tiling to one of the convolution operations";
-
-    // The first result is the transformed linalg.generic (uKernel)
-    tempResultConvs.push_back(localResults[0]);
-
-    // Following, the generated loops
-    SmallVector<Operation*, 6> loopSet;
-    for (int i = 1; i <= 6; ++i)
-      loopSet.push_back(localResults[i]);
-
-    tempResultLoops.push_back(loopSet);
+    // Apply the split (if necessary) & tiling in the genericOp based on the CSA Analysis
+    bool requiresSplit = (res.extra_k2 != 0) || (res.extra_k3 != 0) || (res.extra_tile_c != 0);
+    if (requiresSplit) {
+      if (failed(splitAndTileConvolution(rewriter, getOperation(), genericOp, csa, res, strides, tempResultLoops, tempResultConvs)))
+        return emitSilenceableError() << "Failed to apply split & tiling to the convolution operation";
+    }
+    else {
+      SmallVector<Operation*, 7> localResults;
+      if (failed(applyTileTo(rewriter, getOperation(), genericOp, csa, res, strides, localResults)))
+        return emitSilenceableError() << "Failed to apply tiling to one of the convolution operations";
+      // The first result is the transformed linalg.generic (uKernel)
+      tempResultConvs.push_back(localResults[0]);
+      // Following, the generated loops
+      SmallVector<Operation*, 6> loopSet;
+      for (int i = 1; i <= 6; ++i)
+        loopSet.push_back(localResults[i]);
+      tempResultLoops.push_back(loopSet);
+    }
   }
 
   // Flatten tempResultLoops

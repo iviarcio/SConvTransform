@@ -1204,7 +1204,7 @@ performSplit(RewriterBase &rewriter, TilingInterface op,
 /// It takes the original convolution (`genericOp`), performs the split, and then applies tiling.
 static LogicalResult
 splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operation* target,
-                        CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides,
+                        ConvInfo csaConv, CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides,
                         SmallVector<SmallVector<Operation*, 6>> &resultLoops,
                         SmallVector<Operation*> &resultConvs) {
 
@@ -1215,36 +1215,38 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   MLIRContext *context = rewriter.getContext();
   Location loc = target->getLoc();
 
-  // Define the dimension & tile sizes
+  // Define the dimension & split point to split the convolution
+  // For now, supported split in one dimension only
   CSAStrategy split_res = res;
+
   int64_t splitDim;
-  int64_t tileSize;
-  if (res.extra_k2 != 0) {
+  int64_t splitSize;
+  if (res.extra_tile_c !=0) {
+    splitDim = 3;
+    splitSize = csaConv.num_filters - res.extra_tile_c;
+    split_res.tile_c = 0;
+  }
+  else if (res.extra_k2 != 0) {
     splitDim = res.schd == WS ? 2 : 1;
-    tileSize = res.schd == WS ? csa.mK_.nwindows * res.k2 : csa.mK_.num_filters * res.k2;
+    splitSize = res.schd == WS ? csa.mK_.nwindows * res.k2 : csa.mK_.num_filters * res.k2;
     split_res.k2 = res.extra_k2;
   }
   else if (res.extra_k3 != 0) {
     splitDim = res.schd == IS ? 2 : 1;
-    tileSize = res.schd == IS ? csa.mK_.nwindows * res.k3 : csa.mK_.num_filters * res.k3;
+    splitSize = res.schd == IS ? csa.mK_.nwindows * res.k3 : csa.mK_.num_filters * res.k3;
     split_res.k3 = res.extra_k3;
   }
-  // else if (res.extra_tile_c !=0) {
-  //   splitDim = ?;
-  //   tileSize = ?;
-  //   split_res.tile_c = res.extra_tile_c;
-  // }
 
-  OpFoldResult splitPoint = rewriter.getIndexAttr(tileSize);
-  auto [lowerOp, upperOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
+  OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
+  auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
-  // Apply the tiling for each split
+  // Apply the tiling for each part of the split
   SmallVector<Operation*, 7> firstResults, secondResults;
   
   rewriter.setInsertionPoint(target);
-  if (failed(applyTileTo(rewriter, transformOp, lowerOp, csa, res, strides, firstResults)) ||
-      failed(applyTileTo(rewriter, transformOp, upperOp, csa, split_res, strides, secondResults))) {
-    return transformOp->emitError("Failed to apply tiling after split the convolution.");
+  if (failed(applyTileTo(rewriter, transformOp, firstOp, csa, res, strides, firstResults)) ||
+      failed(applyTileTo(rewriter, transformOp, secondOp, csa, split_res, strides, secondResults))) {
+    return transformOp->emitError("Failed to apply tiling after split the convOp.");
   }
 
   resultConvs.push_back(firstResults[0]);
@@ -1442,7 +1444,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     // Apply the split (if necessary) & tiling in the genericOp based on the CSA Analysis
     bool requiresSplit = (res.extra_k2 != 0) || (res.extra_k3 != 0) || (res.extra_tile_c != 0);
     if (requiresSplit) {
-      if (failed(splitAndTileConvolution(rewriter, getOperation(), genericOp, csa, res, strides, tempResultLoops, tempResultConvs)))
+      if (failed(splitAndTileConvolution(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, tempResultLoops, tempResultConvs)))
         return emitSilenceableError() << "Failed to apply split & tiling to the convolution operation";
     }
     else {

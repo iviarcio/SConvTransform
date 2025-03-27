@@ -1192,11 +1192,86 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   return success();
 }
 
-/// Splits a linalg.generic op along a given dimension and splitPoint
-/// This assumes the dimension is splittable (bounds checked by CSA).
+/// Validates the inputs for linalg::splitOp.
+/// Ensures that the dimension is valid and that the splitPoint, offsets, and sizes
+/// are well-formed (i.e., static and within bounds).
+LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp,
+                                  TilingInterface op, unsigned dim,
+                                  OpFoldResult splitPoint) {
+
+  Location loc = op->getLoc();
+  auto iterationSpace = op.getIterationDomain(rewriter);
+
+  if (dim >= iterationSpace.size()) {
+    return transformOp->emitError()
+           << "Split dimension " << dim << " exceeds iteration domain size "
+           << iterationSpace.size() << ".";
+  }
+
+  auto offset = iterationSpace[dim].offset;
+  auto size = iterationSpace[dim].size;
+
+  // Ensure splitPoint is an index attribute (static)
+  auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
+  if (!splitAttr)
+    return transformOp->emitError("Expected static split point.");
+
+  auto offsetAttr = llvm::dyn_cast_if_present<Attribute>(offset);
+  auto sizeAttr = llvm::dyn_cast_if_present<Attribute>(size);
+  if (!offsetAttr || !sizeAttr)
+    return transformOp->emitError("Expected static offset and size in iteration space.");
+
+  int64_t splitVal = cast<IntegerAttr>(splitAttr).getInt();
+  int64_t offsetVal = cast<IntegerAttr>(offsetAttr).getInt();
+  int64_t sizeVal = cast<IntegerAttr>(sizeAttr).getInt();
+
+  if (splitVal <= 0 || splitVal >= sizeVal) {
+    return transformOp->emitError()
+           << "Invalid split point " << splitVal
+           << " for iteration space size " << sizeVal << ".";
+  }
+
+  // log the iteration domain for debugging
+  LLVM_DEBUG({
+    llvm::dbgs() << "Validated split at dimension " << dim << " with:\n";
+    llvm::dbgs() << "  offset: " << offsetVal << "\n";
+    llvm::dbgs() << "  size:   " << sizeVal << "\n";
+    llvm::dbgs() << "  split:  " << splitVal << "\n";
+  });
+
+  return success();
+}
+
+/// Splits a linalg.generic op along a given dimension and splitPoint.
+/// This assumes the dimension is splittable (CSA already validated bounds).
 std::pair<TilingInterface, TilingInterface>
 performSplit(RewriterBase &rewriter, TilingInterface op,
              unsigned dimension, OpFoldResult splitPoint) {
+
+  Location loc = op->getLoc();
+  MLIRContext *context = rewriter.getContext();
+
+  // Defensive check: ensure dimension is valid
+  auto iterationSpace = op.getIterationDomain(rewriter);
+  if (dimension >= iterationSpace.size()) {
+    llvm::errs() << "split dimension " << dimension << " out of bounds\n";
+    return {TilingInterface(), TilingInterface()};
+  }
+
+  // Defensive check: static splitPoint must not exceed the size
+  if (auto sizeAttr = iterationSpace[dimension].size.dyn_cast<Attribute>()) {
+    auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
+    if (splitAttr) {
+      int64_t splitVal = cast<IntegerAttr>(splitAttr).getInt();
+      int64_t dimSize = cast<IntegerAttr>(sizeAttr).getInt();
+      if (splitVal <= 0 || splitVal >= dimSize) {
+        llvm::errs() << "splitPoint " << splitVal << " is invalid for dimension size " << dimSize << "\n";
+        return {TilingInterface(), TilingInterface()};
+      }
+    }
+  }
+
+  // Perform the actual split
   return linalg::splitOp(rewriter, op, dimension, splitPoint);
 }
 
@@ -1223,7 +1298,7 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   int64_t splitSize;
   if (res.extra_tile_c !=0) {
     splitDim = 3;
-    splitSize = csaConv.num_filters - res.extra_tile_c;
+    splitSize = csaConv.input_channels - res.extra_tile_c;
     split_res.tile_c = 0;
   }
   else if (res.extra_k2 != 0) {
@@ -1238,6 +1313,9 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   }
 
   OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
+  if (failed(validateSplitInputs(rewriter, transformOp, tilingInterfaceOp, splitDim, splitPoint))) {
+    return transformOp->emitError("Invalid dimension or splitPoint to call linalg::splitOp"); 
+  }
   auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
   // Apply the tiling for each part of the split

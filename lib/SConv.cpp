@@ -1156,33 +1156,38 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   for (Operation *loop : innerTiledResults->loops)
     loopOps.push_back(loop);
 
-  // Swap the innner loops in the case of Input Stationary
-  LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
+  // auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  // llvm::errs() << "Loops after tiling: \n" << rootLoop << "\n\n";
 
-  // Promote some inner loop Ops depending on the schedule (WS or IS)
-  LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
-  if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
+  if (res.tile_c != 0) {
+    // Swap the innner loops in the case of Input Stationary
+    LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
+    if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
 
-  // Generate the filter packing
-  LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
+    // Promote some inner loop Ops depending on the schedule (WS or IS)
+    LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
+    if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
 
-  // Generate the input packing
-  LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
-  if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
+    // Generate the filter packing
+    LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
+    if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
 
-  // Fix the uKernel after packing input & filter
-  LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
+    // Generate the input packing
+    LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
+    if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
 
-  // Generate the filter Multi-Packing
-  LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
+    // Fix the uKernel after packing input & filter
+    LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
+    if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
 
-  // Generate the input Multi-Packing
-  LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
-  if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
+    // Generate the filter Multi-Packing
+    LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
+    if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
+
+    // Generate the input Multi-Packing
+    LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
+    if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
+  }
 
   // Store the results (Operation*) in the output variable (as Value)
   outResults.push_back(tiledOps.front());  // The head is the linalg.generic (uKernel)
@@ -1231,14 +1236,6 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
            << " for iteration space size " << sizeVal << ".";
   }
 
-  // log the iteration domain for debugging
-  LLVM_DEBUG({
-    llvm::dbgs() << "Validated split at dimension " << dim << " with:\n";
-    llvm::dbgs() << "  offset: " << offsetVal << "\n";
-    llvm::dbgs() << "  size:   " << sizeVal << "\n";
-    llvm::dbgs() << "  split:  " << splitVal << "\n";
-  });
-
   return success();
 }
 
@@ -1250,6 +1247,8 @@ performSplit(RewriterBase &rewriter, TilingInterface op,
 
   Location loc = op->getLoc();
   MLIRContext *context = rewriter.getContext();
+
+  rewriter.setInsertionPoint(op); 
 
   // Defensive check: ensure dimension is valid
   auto iterationSpace = op.getIterationDomain(rewriter);
@@ -1322,22 +1321,36 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   SmallVector<Operation*, 7> firstResults, secondResults;
   
   rewriter.setInsertionPoint(target);
-  if (failed(applyTileTo(rewriter, transformOp, firstOp, csa, res, strides, firstResults)) ||
-      failed(applyTileTo(rewriter, transformOp, secondOp, csa, split_res, strides, secondResults))) {
-    return transformOp->emitError("Failed to apply tiling after split the convOp.");
+  // if (failed(applyTileTo(rewriter, transformOp, firstOp, csa, res, strides, firstResults)) ||
+  //     failed(applyTileTo(rewriter, transformOp, secondOp, csa, split_res, strides, secondResults))) {
+  //   return transformOp->emitError("Failed to apply tiling after split the convOp.");
+  // }
+
+  if (failed(applyTileTo(rewriter, transformOp, firstOp, csa, res, strides, firstResults))) {
+    return transformOp->emitError("Failed to apply tiling on first convOp after split.");
   }
-
   resultConvs.push_back(firstResults[0]);
-  resultConvs.push_back(secondResults[0]);
-
   SmallVector<Operation*, 6> firstLoopSet;
-  SmallVector<Operation*, 6> secondLoopSet;
   for (int i = 1; i <= 6; ++i) {
     firstLoopSet.push_back(firstResults[i]);
-    secondLoopSet.push_back(secondResults[i]);
   }
   resultLoops.push_back(firstLoopSet);
+
+  // auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
+  // llvm::errs() << "Loops after tiling for first convOp: \n" << root1Loop << "\n\n";
+
+  if (failed(applyTileTo(rewriter, transformOp, secondOp, csa, split_res, strides, secondResults))) {
+    return transformOp->emitError("Failed to apply tiling on second convOp after split.");
+  }
+  resultConvs.push_back(secondResults[0]);
+  SmallVector<Operation*, 6> secondLoopSet;
+  for (int i = 1; i < secondResults.size(); ++i) {
+    secondLoopSet.push_back(secondResults[i]);
+  }
   resultLoops.push_back(secondLoopSet);
+
+  // auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
+  // llvm::errs() << "Loops after tiling for second convOp: \n" << root2Loop << "\n\n";
 
   return success();
 }

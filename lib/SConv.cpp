@@ -197,8 +197,9 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   MLIRContext *context = rewriter.getContext();
 
   // Validate input loops
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
+  int idx = res.tile_c == 0 ? 3 : 4;
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -317,8 +318,9 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
                  CSAStrategy res, SmallVector<Operation *> loopOps) {
 
   // Validate input loops
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
+  int idx = res.tile_c == 0 ? 3 : 4;
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -406,7 +408,8 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
   MLIRContext *context = rewriter.getContext();
 
   // select the loop based on IS or WS
-  int loopIndex = res.schd == IS ? 5 : 4;
+  int idx = res.tile_c == 0 ? 3 : 4;
+  int loopIndex = res.schd == IS ? idx+1 : idx;
 
   // Cast to scf::ForOp the  selected loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
@@ -500,8 +503,9 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
 
   MLIRContext *context = rewriter.getContext();
 
+  int idx = res.tile_c == 0 ? 3 : 4;
   // select the loop based on IS or WS
-  int loopIndex = res.schd == IS ? 4 : 5;
+  int loopIndex = res.schd == IS ? idx : idx+1;
 
   // Cast to scf::ForOp the  selected loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
@@ -607,8 +611,9 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
 
   if (res.schd != IS) return success();
 
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
+  int idx = res.tile_c == 0 ? 3 : 4;
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -673,9 +678,10 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   MLIRContext *context = rewriter.getContext();
 
-  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[3]);
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
+  int idx = res.tile_c == 0 ? 2 : 3;
+  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+2]);
   if (!nestLoop || !outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -900,9 +906,10 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   MLIRContext *context = rewriter.getContext();
 
-  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[3]);
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[4]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[5]);
+  int idx = res.tile_c == 0 ? 2 : 3;
+  auto nestLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+2]);
   if (!nestLoop || !outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
@@ -1159,7 +1166,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
   // llvm::errs() << "Loops after tiling: \n" << rootLoop << "\n\n";
 
-  if (res.tile_c != 0) {
+  // if (res.tile_c != 0) {
     // Swap the innner loops in the case of Input Stationary
     LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
     if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
@@ -1187,7 +1194,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
     // Generate the input Multi-Packing
     LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
     if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
-  }
+  // }
 
   // Store the results (Operation*) in the output variable (as Value)
   outResults.push_back(tiledOps.front());  // The head is the linalg.generic (uKernel)

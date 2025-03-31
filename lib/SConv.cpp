@@ -197,7 +197,7 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   MLIRContext *context = rewriter.getContext();
 
   // Validate input loops
-  int idx = res.tile_c == 0 ? 3 : 4;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
@@ -318,7 +318,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
                  CSAStrategy res, SmallVector<Operation *> loopOps) {
 
   // Validate input loops
-  int idx = res.tile_c == 0 ? 3 : 4;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
@@ -408,7 +408,7 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
   MLIRContext *context = rewriter.getContext();
 
   // select the loop based on IS or WS
-  int idx = res.tile_c == 0 ? 3 : 4;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   int loopIndex = res.schd == IS ? idx+1 : idx;
 
   // Cast to scf::ForOp the  selected loop
@@ -503,7 +503,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
 
   MLIRContext *context = rewriter.getContext();
 
-  int idx = res.tile_c == 0 ? 3 : 4;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   // select the loop based on IS or WS
   int loopIndex = res.schd == IS ? idx : idx+1;
 
@@ -611,7 +611,7 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
 
   if (res.schd != IS) return success();
 
-  int idx = res.tile_c == 0 ? 3 : 4;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
@@ -678,7 +678,7 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   MLIRContext *context = rewriter.getContext();
 
-  int idx = res.tile_c == 0 ? 2 : 3;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
   auto nestLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+2]);
@@ -906,7 +906,7 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   MLIRContext *context = rewriter.getContext();
 
-  int idx = res.tile_c == 0 ? 2 : 3;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
   auto nestLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+2]);
@@ -1166,35 +1166,33 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
   // llvm::errs() << "Loops after tiling: \n" << rootLoop << "\n\n";
 
-  // if (res.tile_c != 0) {
-    // Swap the innner loops in the case of Input Stationary
-    LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
-    if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
+  // Swap the innner loops in the case of Input Stationary
+  LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
 
-    // Promote some inner loop Ops depending on the schedule (WS or IS)
-    LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
-    if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
+  // Promote some inner loop Ops depending on the schedule (WS or IS)
+  LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
+  if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
 
-    // Generate the filter packing
-    LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
-    if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
+  // Generate the filter packing
+  LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
 
-    // Generate the input packing
-    LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
-    if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
+  // Generate the input packing
+  LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
+  if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
 
-    // Fix the uKernel after packing input & filter
-    LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
-    if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
+  // Fix the uKernel after packing input & filter
+  LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
 
-    // Generate the filter Multi-Packing
-    LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
-    if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
+  // Generate the filter Multi-Packing
+  LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
 
-    // Generate the input Multi-Packing
-    LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
-    if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
-  // }
+  // Generate the input Multi-Packing
+  LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
+  if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
 
   // Store the results (Operation*) in the output variable (as Value)
   outResults.push_back(tiledOps.front());  // The head is the linalg.generic (uKernel)
@@ -1222,6 +1220,20 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
 
   auto offset = iterationSpace[dim].offset;
   auto size = iterationSpace[dim].size;
+
+  llvm::errs() << "=== Iteration Domain Sizes ===\n";
+  for (unsigned i = 0; i < iterationSpace.size(); ++i) {
+    llvm::errs() << "Dim " << i << ": ";
+    OpFoldResult size = iterationSpace[i].size;
+    if (auto attr = size.dyn_cast<Attribute>()) {
+      attr.print(llvm::errs());
+    } else if (auto val = size.dyn_cast<Value>()) {
+      val.print(llvm::errs());
+    } else {
+      llvm::errs() << "Unknown\n";
+    }
+    llvm::errs() << "\n";
+  }
 
   // Ensure splitPoint is an index attribute (static)
   auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
@@ -1302,6 +1314,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
 
   int64_t splitDim;
   int64_t splitSize;
+  int64_t extraSize;
+
   if (res.extra_tile_c !=0) {
     splitDim = 3;
     splitSize = csaConv.input_channels - res.extra_tile_c;
@@ -1309,13 +1323,15 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   }
   else if (res.extra_k2 != 0) {
     splitDim = res.schd == WS ? 2 : 1;
-    splitSize = res.schd == WS ? csa.mK_.nwindows * res.k2 : csa.mK_.num_filters * res.k2;
-    split_res.k2 = res.extra_k2;
+    extraSize = res.schd == WS ? csa.mK_.nwindows * res.extra_k2 : csa.mK_.num_filters * res.extra_k2;
+    splitSize = csaConv.output_rows * csaConv.output_cols - extraSize;
+    split_res.k2 = 0;
   }
   else if (res.extra_k3 != 0) {
     splitDim = res.schd == IS ? 2 : 1;
-    splitSize = res.schd == IS ? csa.mK_.nwindows * res.k3 : csa.mK_.num_filters * res.k3;
-    split_res.k3 = res.extra_k3;
+    extraSize = res.schd == IS ? csa.mK_.nwindows * res.extra_k3 : csa.mK_.num_filters * res.extra_k3;
+    splitSize = csaConv.output_rows * csaConv.output_cols - extraSize;
+    split_res.k3 = 0;
   }
 
   OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
@@ -1323,6 +1339,12 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
     return transformOp->emitError("Invalid dimension or splitPoint to call linalg::splitOp"); 
   }
   auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
+
+  llvm::errs() << "=== Splitted kernels ===\n";
+  llvm::errs() << "First One :\n ";
+  firstOp.print(llvm::errs());
+  llvm::errs() << "Last One :\n ";
+  secondOp.print(llvm::errs());
 
   // Apply the tiling for each part of the split
   SmallVector<Operation*, 7> firstResults, secondResults;

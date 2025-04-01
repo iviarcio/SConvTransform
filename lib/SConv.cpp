@@ -197,7 +197,8 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   MLIRContext *context = rewriter.getContext();
 
   // Validate input loops
-  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  int idx = (res.tile_c == 0) ? 3 : 4;
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
@@ -318,7 +319,8 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
                  CSAStrategy res, SmallVector<Operation *> loopOps) {
 
   // Validate input loops
-  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  int idx = (res.tile_c == 0) ? 3 : 4;
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
@@ -408,7 +410,8 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
   MLIRContext *context = rewriter.getContext();
 
   // select the loop based on IS or WS
-  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  int idx = (res.tile_c == 0) ? 3 : 4;
   int loopIndex = res.schd == IS ? idx+1 : idx;
 
   // Cast to scf::ForOp the  selected loop
@@ -503,7 +506,8 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
 
   MLIRContext *context = rewriter.getContext();
 
-  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  int idx = (res.tile_c == 0) ? 3 : 4;
   // select the loop based on IS or WS
   int loopIndex = res.schd == IS ? idx : idx+1;
 
@@ -611,7 +615,8 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
 
   if (res.schd != IS) return success();
 
-  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  int idx = (res.tile_c == 0) ? 3 : 4;
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
@@ -678,7 +683,8 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   MLIRContext *context = rewriter.getContext();
 
-  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
+  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
+  int idx = (res.tile_c == 0) ? 2 : 3;
   auto nestLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+2]);
@@ -906,7 +912,8 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   MLIRContext *context = rewriter.getContext();
 
-  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
+  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
+  int idx = (res.tile_c == 0) ? 2 : 3;
   auto nestLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+2]);
@@ -1293,7 +1300,7 @@ performSplit(RewriterBase &rewriter, TilingInterface op,
   return linalg::splitOp(rewriter, op, dimension, splitPoint);
 }
 
-/// This function will be called when the convolution needs to be split.
+/// This function will be called when the convolution needs to be Splitted.
 /// It takes the original convolution (`genericOp`), performs the split, and then applies tiling.
 static LogicalResult
 splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operation* target,
@@ -1325,13 +1332,15 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
     splitDim = res.schd == WS ? 2 : 1;
     extraSize = res.schd == WS ? csa.mK_.nwindows * res.extra_k2 : csa.mK_.num_filters * res.extra_k2;
     splitSize = csaConv.output_rows * csaConv.output_cols - extraSize;
-    split_res.k2 = 0;
+    // split_res.k2 = 0;
+    split_res.k2 = res.extra_k2;
   }
   else if (res.extra_k3 != 0) {
     splitDim = res.schd == IS ? 2 : 1;
     extraSize = res.schd == IS ? csa.mK_.nwindows * res.extra_k3 : csa.mK_.num_filters * res.extra_k3;
     splitSize = csaConv.output_rows * csaConv.output_cols - extraSize;
-    split_res.k3 = 0;
+    // split_res.k3 = 0;
+    split_res.k3 = res.extra_k3;
   }
 
   OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
@@ -1350,10 +1359,6 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   SmallVector<Operation*, 7> firstResults, secondResults;
   
   rewriter.setInsertionPoint(target);
-  // if (failed(applyTileTo(rewriter, transformOp, firstOp, csa, res, strides, firstResults)) ||
-  //     failed(applyTileTo(rewriter, transformOp, secondOp, csa, split_res, strides, secondResults))) {
-  //   return transformOp->emitError("Failed to apply tiling after split the convOp.");
-  // }
 
   if (failed(applyTileTo(rewriter, transformOp, firstOp, csa, res, strides, firstResults))) {
     return transformOp->emitError("Failed to apply tiling on first convOp after split.");

@@ -1173,33 +1173,33 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
   // llvm::errs() << "Loops after tiling: \n" << rootLoop << "\n\n";
 
-  // Swap the innner loops in the case of Input Stationary
-  LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
-
-  // Promote some inner loop Ops depending on the schedule (WS or IS)
-  LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
-  if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
-
-  // Generate the filter packing
-  LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
-
-  // Generate the input packing
-  LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
-  if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
-
-  // Fix the uKernel after packing input & filter
-  LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
-
-  // Generate the filter Multi-Packing
-  LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
-  if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
-
-  // Generate the input Multi-Packing
-  LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
-  if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
+  // // Swap the innner loops in the case of Input Stationary
+  // LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
+  // if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
+  //
+  // // Promote some inner loop Ops depending on the schedule (WS or IS)
+  // LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
+  // if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
+  //
+  // // Generate the filter packing
+  // LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
+  // if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
+  //
+  // // Generate the input packing
+  // LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
+  // if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
+  //
+  // // Fix the uKernel after packing input & filter
+  // LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
+  // if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
+  //
+  // // Generate the filter Multi-Packing
+  // LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
+  // if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
+  //
+  // // Generate the input Multi-Packing
+  // LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
+  // if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
 
   // Store the results (Operation*) in the output variable (as Value)
   outResults.push_back(tiledOps.front());  // The head is the linalg.generic (uKernel)
@@ -1513,13 +1513,21 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     auto outputShape = outputType.getShape();
     int64_t n = outputShape[0];
     int64_t ic = inputShape[1];
+    int64_t ih = inputShape[2];
+    int64_t iw = inputShape[3];
     int64_t fh = filterShape[2];
     int64_t fw = filterShape[3];
     int64_t oc = outputShape[1];
     int64_t oh = outputShape[2];
     int64_t ow = outputShape[3];
 
-    // Create the Collapse shape to be inserted at begining
+    // Create the Collapse shape of input tensor
+    SmallVector<ReassociationIndices> inputReassocIndices = {{0}, {1}, {2, 3}};
+    auto reshapedInputType = RankedTensorType::get({n, ic, ih * iw}, inputType.getElementType());
+    Value reshapedInput = rewriter.create<tensor::CollapseShapeOp>(
+        loc, reshapedInputType, input, inputReassocIndices);
+
+    // Create the Collapse shape of output tensor
     SmallVector<ReassociationIndices> outputReassocIndices = {{0}, {1}, {2, 3}};
     auto reshapedOutputType = RankedTensorType::get({n, oc, oh * ow}, outputType.getElementType());
     Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
@@ -1535,17 +1543,20 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     auto wstride = convOp.getStrides().getValues<int64_t>()[1];
     SmallVector<int64_t, 2> strides = {hstride, wstride};
 
-    AffineExpr d0, d1, d2, d3, d4, d5;
-    bindDims(context, d0, d1, d2, d3, d4, d5);
-    auto lhsMap = AffineMap::get(6, 0, {d0, d3, d2.floorDiv(oh) * hstride + d4, d2 % oh * wstride + d5}, context);
-    auto rhsMap = AffineMap::get(6, 0, {d1, d3, d4, d5}, context);
-    auto resultMap = AffineMap::get(6, 0, {d0, d1, d2}, context);
+    // definitions:
+    // d0 = batch; d1 = filter; d2 = output height; d3 = output width; d4 = channels; d5 = filter height; d6 = filter width
+
+    AffineExpr d0, d1, d3, d4, d5, d6;
+    bindDims(context, d0, d1, d3, d4, d5, d6);
+    auto lhsMap = AffineMap::get(6, 0, {d0, d4, (d3.floorDiv(oh) * hstride + d5) * ih + d3 % oh * wstride + d6}, context);
+    auto rhsMap = AffineMap::get(6, 0, {d1, d4, d5, d6}, context);
+    auto resultMap = AffineMap::get(6, 0, {d0, d1, d3}, context);
 
     // Create the new genericOp that replaces the named convolution
     auto genericOp = rewriter.create<linalg::GenericOp>(
         loc,
         reshapedOutputType,
-        inputs,
+        ValueRange{reshapedInput, inputs[1]},
         ValueRange{reshapedOutput},
         ArrayRef<AffineMap>{lhsMap, rhsMap, resultMap},
         newOpIterators,
@@ -1567,12 +1578,12 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     CSAStrategy res = csa();
     
     // Apply the split (if necessary) & tiling in the genericOp based on the CSA Analysis
-    bool requiresSplit = (res.extra_k2 != 0) || (res.extra_k3 != 0) || (res.extra_tile_c != 0);
-    if (requiresSplit) {
-      if (failed(splitAndTileConvolution(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, tempResultLoops, tempResultConvs)))
-        return emitSilenceableError() << "Failed to apply split & tiling to the convolution operation";
-    }
-    else {
+    // bool requiresSplit = (res.extra_k2 != 0) || (res.extra_k3 != 0) || (res.extra_tile_c != 0);
+    // if (requiresSplit) {
+    //   if (failed(splitAndTileConvolution(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, tempResultLoops, tempResultConvs)))
+    //     return emitSilenceableError() << "Failed to apply split & tiling to the convolution operation";
+    // }
+    // else {
       SmallVector<Operation*, 7> localResults;
       if (failed(applyTileTo(rewriter, getOperation(), genericOp, csa, res, strides, localResults)))
         return emitSilenceableError() << "Failed to apply tiling to one of the convolution operations";
@@ -1583,7 +1594,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
       for (int i = 1; i <= 6; ++i)
         loopSet.push_back(localResults[i]);
       tempResultLoops.push_back(loopSet);
-    }
+    // }
   }
 
   // Flatten tempResultLoops

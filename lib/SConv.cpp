@@ -173,8 +173,8 @@ static SmallVector<Value, 3> computeLinearInputIndices(
   int64_t strideW = strides[1];
 
   //  NcIndex (iNc) = iK floorDiv (Fh * Fw)
-  AffineMap NcMap = AffineMap::get(2, 0, {iK.floorDiv(Fh * Fw)}, context);
-  Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {kIndex, nwinIndex});
+  AffineMap NcMap = AffineMap::get(3, 0, {iK.floorDiv(Fh * Fw)}, context);
+  Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {iLstart, kIndex, nwinIndex});
 
   AffineExpr iHwExpr =
     (((((iL + iNwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH) +

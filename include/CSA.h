@@ -7,6 +7,7 @@ typedef enum { IS = 1, WS } Scheduling;
 
 typedef struct {
   int64_t input_channels;
+  int64_t input_cols;
   int64_t output_rows;
   int64_t output_cols;
   int64_t kernel_rows;

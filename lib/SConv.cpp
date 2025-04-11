@@ -144,10 +144,8 @@ static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
   return *multiIndex;
 }
 
-// Given indices corresponding to iterators in the output (oIndex) and filter
-// (fIndex) for a convolution, compute the convolved index for the input as
-// `oIndex * stride + fIndex`.
-static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
+// Compute the multi-packing filter indices considering strides and tensor structure.
+static Value computeFilterIndices(OpBuilder &b, Location loc, Value oIndex,
                                Value fIndex, int64_t stride) {
   AffineExpr oExpr, fExpr, strideExpr;
   bindDims(b.getContext(), oExpr, fExpr);
@@ -160,8 +158,123 @@ static Value getConvolvedIndex(OpBuilder &b, Location loc, Value oIndex,
   return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
 }
 
-// Compute the input indices considering strides and tensor structure.
-static SmallVector<Value, 3> computeInputIndices(
+// // Compute the input indices considering strides and tensor structure.
+// static SmallVector<Value, 3> computeInputIndices(
+//     OpBuilder &b, Location loc, Value nIndex, Value kIndex, Value nwinIndex,
+//     int64_t Fh, int64_t Fw, int64_t Nwin, SmallVector<int64_t, 2> strides) {
+//
+//   MLIRContext *context = b.getContext();
+//   AffineExpr iN, iK, iNwin;
+//   bindDims(context, iN, iK, iNwin);
+//
+//   //  NcIndex (iNc) = iK floorDiv (Fh * Fw)
+//   AffineMap NcMap = AffineMap::get(3, 0, {iK.floorDiv(Fh * Fw)}, context);
+//   Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {nIndex, kIndex, nwinIndex});
+//
+//   // ThIndex (iTh) = (iK mod (Fh * Fw)) FloorDiv Fw
+//   AffineMap ThMap = AffineMap::get(3, 0, { (iK % (Fh * Fw)).floorDiv(Fw) }, context);
+//   Value ThIndex = affine::makeComposedAffineApply(b, loc, ThMap, {nIndex, kIndex, nwinIndex});
+//
+//   // TwIndex (iTw) =  iK mod Fw + iNwin * stride[1] 
+//   AffineMap TwMap = AffineMap::get(3, 0, { iK % Fw + iNwin * strides[1] }, context);
+//   Value TwIndex = affine::makeComposedAffineApply(b, loc, TwMap, {nIndex, kIndex, nwinIndex});
+//
+//   return {NcIndex, ThIndex, TwIndex};
+// }
+
+// Compute the linearized input indices considering strides and tensor structure.
+static SmallVector<Value, 3> computeLinearInputIndices(
+    OpBuilder &b, Location loc, Value nIndex, Value kIndex, Value nwinIndex, Value iLstart,
+    int64_t Fh, int64_t Fw, int64_t Ow, SmallVector<int64_t, 2> strides) {
+
+  MLIRContext *context = b.getContext();
+  AffineExpr iL, iK, iNwin;
+  bindDims(context, iL, iK, iNwin);
+
+  int64_t filterHW = Fh * Fw;
+  int64_t strideH = strides[0];
+  int64_t strideW = strides[1];
+
+  //  NcIndex (iNc) = iK floorDiv (Fh * Fw)
+  AffineMap NcMap = AffineMap::get(3, 0, {iK.floorDiv(Fh * Fw)}, context);
+  Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {nIndex, kIndex, nwinIndex});
+
+  // AffineExpr iHwExpr =
+  //     (((((iL + iNwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH) +
+  //        ((iK % filterHW).floorDiv(Fw))) * strideH) +
+  //     (((iL + iNwin) % Ow - iL % Ow) * strideW) +
+  //     (iK % Fw);
+  //
+  // AffineMap iHwMap = AffineMap::get(3, 0, {iHwExpr}, context);
+  // Value HwIndex = affine::makeComposedAffineApply(b, loc, iHwMap, {iLstart, kIndex, nwinIndex});
+
+  // iHW_1 = ((iL + iNwin)/Ow - iL/Ow) * strideH + ((iK % FhFw)/Fw)) * strideH
+  AffineExpr hw1Expr = (((iL + iNwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH +
+     (iK % filterHW).floorDiv(Fw)) * strideH;
+
+  AffineMap Hw1Map = AffineMap::get(3, 0, {hw1Expr}, context);
+  Value iHW_1 = affine::makeComposedAffineApply(b, loc, Hw1Map, {iLstart, kIndex, nwinIndex});
+
+  // iHW_2 = ((iL + iNwin) % Ow - iL % Ow) * strideW + (iK % Fw)
+  AffineExpr hw2Expr = ((iL + iNwin) % Ow - iL % Ow) * strideW + (iK % Fw);
+
+  AffineMap Hw2Map = AffineMap::get(3, 0, {hw2Expr}, context);
+  Value iHW_2 = affine::makeComposedAffineApply(b, loc, Hw2Map, {iLstart, kIndex, nwinIndex});
+
+  // iHW = iHW_1 + iHW_2
+  AffineExpr d0, d1;
+  bindDims(context, d0, d1);
+  AffineMap mapAdd = AffineMap::get(2, 0, {d0 + d1}, context);
+  Value HwIndex = affine::makeComposedAffineApply(b, loc, mapAdd, {iHW_1, iHW_2});
+
+  // // (i_Lstart + i_Nwin) / OW
+  // AffineMap mapDivSum = AffineMap::get(3, 0, {(iL + iNwin).floorDiv(Ow)}, context);
+  // Value divSum = affine::makeComposedAffineApply(b, loc, mapDivSum, {iLstart, kIndex, nwinIndex});
+  //
+  // // (i_Lstart + i_Nwin) % OW
+  // AffineMap mapModSum = AffineMap::get(3, 0, {(iL + iNwin) % Ow}, context);
+  // Value modSum = affine::makeComposedAffineApply(b, loc, mapModSum, {iLstart, kIndex, nwinIndex});
+  //
+  // // (i_K mod (Fh * Fw)) / Fw
+  // AffineMap mapDivHW = AffineMap::get(3, 0, {(iK % filterHW).floorDiv(Fw)}, context);
+  // Value divHW = affine::makeComposedAffineApply(b, loc, mapDivHW, {nIndex, kIndex, nwinIndex});
+  //
+  // // (4) i_Lstart / OW
+  // AffineMap mapDivStart = AffineMap::get(3, 0, {iL.floorDiv(Ow)}, context);
+  // Value divStart = affine::makeComposedAffineApply(b, loc, mapDivStart, {iLstart, kIndex, nwinIndex});
+  //
+  // // (5) i_Lstart % OW
+  // AffineMap mapModStart = AffineMap::get(3, 0, {iL % Ow}, context);
+  // Value modStart = affine::makeComposedAffineApply(b, loc, mapModStart, {iLstart, kIndex, nwinIndex});
+  //
+  // // deltaDiv = (iL + iNwin)/Ow - iL/Ow
+  // Value deltaDiv = b.create<arith::SubIOp>(loc, divSum, divStart);
+  //
+  // // deltaMod = (iL + iNwin) % Ow - iL % Ow
+  // Value deltaMod = b.create<arith::SubIOp>(loc, modSum, modStart);
+  //
+  // // strideH & strideW as Value
+  // Value strideHVal = b.create<arith::ConstantIndexOp>(loc, strideH);
+  // Value strideWVal = b.create<arith::ConstantIndexOp>(loc, strideW);
+  //
+  // Value part1 = b.create<arith::MulIOp>(loc, deltaDiv, strideHVal);
+  // Value part2 = b.create<arith::AddIOp>(loc, part1, divHW);
+  // Value part3 = b.create<arith::MulIOp>(loc, part2, strideHVal);
+  // Value part4 = b.create<arith::MulIOp>(loc, deltaMod, strideWVal);
+  //
+  // // i_K mod Fw
+  // AffineMap mapModFW = AffineMap::get(3, 0, {iK % Fw}, context);
+  // Value modF = affine::makeComposedAffineApply(b, loc, mapModFW, {nIndex, kIndex, nwinIndex});
+  //
+  // // Final sum
+  // Value sumFinal = b.create<arith::AddIOp>(loc, part3, part4);
+  // Value HwIndex = b.create<arith::AddIOp>(loc, sumFinal, modF);
+
+  return {NcIndex, HwIndex};
+}
+
+// Compute the multi-pack input indices considering strides and tensor structure.
+static SmallVector<Value, 3> computeMultiPackInputIndices(
     OpBuilder &b, Location loc, Value nIndex, Value tIndex, Value kIndex,
     Value nwinIndex, int64_t Tw, int64_t Fh, int64_t Fw, int64_t Nwin, 
     SmallVector<int64_t, 2> strides) {
@@ -331,7 +444,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
   Block *innerBody = innerLoop.getBody();
 
   Operation *affineApply1 = nullptr;
-  Operation *affineApply2 = nullptr;
+  // Operation *affineApply2 = nullptr;
   Operation *tensorExtractSlice1 = nullptr;
   Operation *tensorExtractSlice2 = nullptr;
 
@@ -339,26 +452,28 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
   for (Operation &op : innerBody->getOperations()) {
     if (!affineApply1 && isa<AffineApplyOp>(&op))
       affineApply1 = &op;
-    else if (!affineApply2 && isa<AffineApplyOp>(&op))
-      affineApply2 = &op;
+    // else if (!affineApply2 && isa<AffineApplyOp>(&op))
+    //   affineApply2 = &op;
     else if (!tensorExtractSlice1 && isa<tensor::ExtractSliceOp>(&op))
       tensorExtractSlice1 = &op;
     else if (!tensorExtractSlice2 && isa<tensor::ExtractSliceOp>(&op))
       tensorExtractSlice2 = &op;
 
     // Stop once all target operations are found
-    if (affineApply1 && affineApply2 && tensorExtractSlice1 && tensorExtractSlice2)
+    // if (affineApply1 && affineApply2 && tensorExtractSlice1 && tensorExtractSlice2)
+    if (affineApply1 && tensorExtractSlice1 && tensorExtractSlice2)
       break;
   }
 
-  if (!affineApply1 || !affineApply2 || !tensorExtractSlice1 || !tensorExtractSlice2)
+  // if (!affineApply1 || !affineApply2 || !tensorExtractSlice1 || !tensorExtractSlice2)
+  if (!affineApply1 || !tensorExtractSlice1 || !tensorExtractSlice2)
     return transformOp->emitError("Failed to hosting Ops");
 
   // Set insertion point at the start of outer loop
   rewriter.setInsertionPointToStart(outerBody);
 
   Operation *promotedAffineApply1 = nullptr;
-  Operation *promotedAffineApply2 = nullptr;
+  // Operation *promotedAffineApply2 = nullptr;
   Operation *promotedTensorExtractSlice1 = nullptr;
   Operation *promotedTensorExtractSlice2 = nullptr;
 
@@ -368,9 +483,9 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
     promotedAffineApply1 = rewriter.create<AffineApplyOp>(
       affineApply1->getLoc(), affineApply1->getAttrOfType<AffineMapAttr>("map"), outIndVar1);
 
-    SmallVector<Value, 1> outIndVar2 = {outerLoop.getInductionVar()};
-    promotedAffineApply2 = rewriter.create<AffineApplyOp>(
-      affineApply2->getLoc(), affineApply2->getAttrOfType<AffineMapAttr>("map"), outIndVar2);
+    // SmallVector<Value, 1> outIndVar2 = {outerLoop.getInductionVar()};
+    // promotedAffineApply2 = rewriter.create<AffineApplyOp>(
+    //   affineApply2->getLoc(), affineApply2->getAttrOfType<AffineMapAttr>("map"), outIndVar2);
 
     promotedTensorExtractSlice1 = rewriter.clone(*tensorExtractSlice1);
   }
@@ -383,8 +498,8 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
     for (auto &operand : op->getOpOperands()) {
       if (res.schd == IS && operand.get() == affineApply1->getResult(0))
         operand.set(promotedAffineApply1->getResult(0));
-      else if (res.schd == IS && operand.get() == affineApply2->getResult(0))
-        operand.set(promotedAffineApply2->getResult(0));
+      // else if (res.schd == IS && operand.get() == affineApply2->getResult(0))
+      //   operand.set(promotedAffineApply2->getResult(0));
       else if (res.schd == IS && operand.get() == tensorExtractSlice1->getResult(0))
         operand.set(promotedTensorExtractSlice1->getResult(0));
       else if (res.schd == WS && operand.get() == tensorExtractSlice2->getResult(0))
@@ -394,7 +509,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
 
   // Erase the old operations
   if (affineApply1->use_empty()) rewriter.eraseOp(affineApply1);
-  if (affineApply2->use_empty()) rewriter.eraseOp(affineApply2);
+  // if (affineApply2->use_empty()) rewriter.eraseOp(affineApply2);
   if (tensorExtractSlice1->use_empty()) rewriter.eraseOp(tensorExtractSlice1);
   if (tensorExtractSlice2->use_empty()) rewriter.eraseOp(tensorExtractSlice2);
 
@@ -506,10 +621,10 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
 
   MLIRContext *context = rewriter.getContext();
 
-  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   int idx = (res.tile_c == 0) ? 3 : 4;
   // select the loop based on IS or WS
   int loopIndex = res.schd == IS ? idx : idx+1;
+  int outerIndex = 2; /* Always ?? */
 
   // Cast to scf::ForOp the  selected loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
@@ -568,34 +683,40 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, CSA csa,
   SmallVector<int64_t, 3> inputPackingShape = {n, ic * fh * fw, nw};
   Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());
 
+  // Compute the iL_start = iO_out + iO_in where:
+  // iO_out = the outermost output tiling loop iterator
+  // iO_in = the innermost output tiling loop iterator 
+  Value iO_out = dyn_cast<scf::ForOp>(loopOps[outerIndex]).getInductionVar();
+  Value iO_in  = dyn_cast<scf::ForOp>(loopOps[loopIndex]).getInductionVar();
+
+  AffineExpr d0, d1;
+  bindDims(context, d0, d1);
+  AffineMap mapStart = AffineMap::get(2, 0, {d0 + d1}, context);
+  Value iLstart = affine::makeComposedAffineApply(rewriter, loc, mapStart, {iO_out, iO_in});
+
   auto nloops = inputPackingShape.size();
   auto parallel = utils::IteratorType::parallel;
   SmallVector<utils::IteratorType, 3> packingIterators(nloops, parallel);
   SmallVector<AffineMap, 3> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
 
+  // create the input packing
   auto packingTensor = rewriter.create<linalg::GenericOp>(
     loc, inputPacking.getType(),
     /*inputs=*/ValueRange{}, /*outputs=*/inputPacking, packingIndexingMaps,
     packingIterators,
 
     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-      // Get the iterators
-      Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0); // n
-      Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1); // ic × fh × fw
-      Value index2 = nestedBuilder.create<linalg::IndexOp>(loc, 2); // nw 
+      Value iN = nestedBuilder.create<linalg::IndexOp>(loc, 0);    // n
+      Value iK = nestedBuilder.create<linalg::IndexOp>(loc, 1);    // ic * fh * fw
+      Value iNwin = nestedBuilder.create<linalg::IndexOp>(loc, 2); // nw
 
-      // Unroll index1 into {ic, fh, fw}
-      SmallVector<Value> unpackedSpatialIndices = unrollIndex(
-          nestedBuilder, nestedLoc, index1, ArrayRef<int64_t>{ic, fh, fw});
-      Value icIndex = unpackedSpatialIndices[0];
-      Value fhIndex = unpackedSpatialIndices[1];
-      Value fwIndex = unpackedSpatialIndices[2];
-
-      // Compute the actual spatial indices using strides
-      Value wIndex = getConvolvedIndex(nestedBuilder, nestedLoc, index2, fwIndex, strides[1]);
+      SmallVector<Value, 2> inputIndices = computeLinearInputIndices(
+          nestedBuilder, nestedLoc, iN, iK, iNwin, iLstart, fh, fw, ow, strides);
+      Value iNc = inputIndices[0];
+      Value iHw = inputIndices[1];
 
       // Create the extraction indices for the original input tensor
-      SmallVector<Value> extractionIndices{index0, icIndex, fhIndex, wIndex};
+      SmallVector<Value> extractionIndices{iN, iNc, iHw};
 
       // Extract the value from the original input tensor
       Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, input, extractionIndices);
@@ -763,7 +884,7 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
     Value iK = nestedBuilder.create<linalg::IndexOp>(loc, 2);
     Value iNwin = nestedBuilder.create<linalg::IndexOp>(loc, 3);
 
-    SmallVector<Value, 3> inputIndices = computeInputIndices(
+    SmallVector<Value, 3> inputIndices = computeMultiPackInputIndices(
         nestedBuilder, nestedLoc, iN, iT, iK, iNwin, Tw, Fh, Fw, Nwin, strides);
     Value iNc = inputIndices[0];
     Value iTh = inputIndices[1];
@@ -975,7 +1096,7 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
     Value FhIndex = unpackedIndices[1];
     Value FwIndex = unpackedIndices[2];
 
-    Value kIndex = getConvolvedIndex(nestedBuilder, nestedLoc, index0, index2, Nf);
+    Value kIndex = computeFilterIndices(nestedBuilder, nestedLoc, index0, index2, Nf);
     SmallVector<Value> extractionIndices{kIndex, NcIndex, FhIndex, FwIndex};
 
     Value filterVal = nestedBuilder.create<tensor::ExtractOp>(loc, filterSlice, extractionIndices);
@@ -1173,30 +1294,30 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
   // llvm::errs() << "Loops after tiling: \n" << rootLoop << "\n\n";
 
-  // // Swap the innner loops in the case of Input Stationary
-  // LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
-  // if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
-  //
-  // // Promote some inner loop Ops depending on the schedule (WS or IS)
-  // LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
-  // if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
-  //
+  // Swap the innner loops in the case of Input Stationary
+  LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
+
+  // Promote some inner loop Ops depending on the schedule (WS or IS)
+  LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
+  if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
+
   // // Generate the filter packing
-  // LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
-  // if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
-  //
-  // // Generate the input packing
-  // LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
-  // if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
-  //
-  // // Fix the uKernel after packing input & filter
-  // LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
-  // if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
-  //
+  LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
+
+  // Generate the input packing
+  LogicalResult result3 = applyInputPacking(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
+  if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
+
+  // Fix the uKernel after packing input & filter
+  LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
+
   // // Generate the filter Multi-Packing
   // LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
   // if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
-  //
+
   // // Generate the input Multi-Packing
   // LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csa, res, strides, tiledOps, loopOps);
   // if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");

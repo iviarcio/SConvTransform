@@ -188,8 +188,8 @@ static SmallVector<Value, 3> computeLinearInputIndices(
     int64_t Fh, int64_t Fw, int64_t Ow, SmallVector<int64_t, 2> strides) {
 
   MLIRContext *context = b.getContext();
-  AffineExpr iL, iK, iNwin;
-  bindDims(context, iL, iK, iNwin);
+  AffineExpr iN, iK, iNwin, iL;
+  bindDims(context, iN, iK, iNwin, iL);
 
   int64_t filterHW = Fh * Fw;
   int64_t strideH = strides[0];
@@ -199,76 +199,33 @@ static SmallVector<Value, 3> computeLinearInputIndices(
   AffineMap NcMap = AffineMap::get(3, 0, {iK.floorDiv(Fh * Fw)}, context);
   Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {nIndex, kIndex, nwinIndex});
 
-  // AffineExpr iHwExpr =
-  //     (((((iL + iNwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH) +
-  //        ((iK % filterHW).floorDiv(Fw))) * strideH) +
-  //     (((iL + iNwin) % Ow - iL % Ow) * strideW) +
-  //     (iK % Fw);
-  //
-  // AffineMap iHwMap = AffineMap::get(3, 0, {iHwExpr}, context);
-  // Value HwIndex = affine::makeComposedAffineApply(b, loc, iHwMap, {iLstart, kIndex, nwinIndex});
+  AffineExpr iHwExpr =
+    (((((iL + iNwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH) +
+       ((iK % filterHW).floorDiv(Fw))) * strideH) +
+    (((iL + iNwin) % Ow - iL % Ow) * strideW) +
+    (iK % Fw);
 
-  // iHW_1 = ((iL + iNwin)/Ow - iL/Ow) * strideH + ((iK % FhFw)/Fw)) * strideH
-  AffineExpr hw1Expr = (((iL + iNwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH +
-     (iK % filterHW).floorDiv(Fw)) * strideH;
+  AffineMap iHwMap = AffineMap::get(4, 0, {iHwExpr}, context);
+  Value HwIndex = affine::makeComposedAffineApply(b, loc, iHwMap, {nIndex, kIndex, nwinIndex, iLstart});
 
-  AffineMap Hw1Map = AffineMap::get(3, 0, {hw1Expr}, context);
-  Value iHW_1 = affine::makeComposedAffineApply(b, loc, Hw1Map, {iLstart, kIndex, nwinIndex});
-
-  // iHW_2 = ((iL + iNwin) % Ow - iL % Ow) * strideW + (iK % Fw)
-  AffineExpr hw2Expr = ((iL + iNwin) % Ow - iL % Ow) * strideW + (iK % Fw);
-
-  AffineMap Hw2Map = AffineMap::get(3, 0, {hw2Expr}, context);
-  Value iHW_2 = affine::makeComposedAffineApply(b, loc, Hw2Map, {iLstart, kIndex, nwinIndex});
-
-  // iHW = iHW_1 + iHW_2
-  AffineExpr d0, d1;
-  bindDims(context, d0, d1);
-  AffineMap mapAdd = AffineMap::get(2, 0, {d0 + d1}, context);
-  Value HwIndex = affine::makeComposedAffineApply(b, loc, mapAdd, {iHW_1, iHW_2});
-
-  // // (i_Lstart + i_Nwin) / OW
-  // AffineMap mapDivSum = AffineMap::get(3, 0, {(iL + iNwin).floorDiv(Ow)}, context);
-  // Value divSum = affine::makeComposedAffineApply(b, loc, mapDivSum, {iLstart, kIndex, nwinIndex});
+  // // iHW_1 = ((iL + iNwin)/Ow - iL/Ow) * strideH + ((iK % FhFw)/Fw)) * strideH
+  // AffineExpr hw1Expr = (((iL + iNwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH +
+  //    (iK % filterHW).floorDiv(Fw)) * strideH;
   //
-  // // (i_Lstart + i_Nwin) % OW
-  // AffineMap mapModSum = AffineMap::get(3, 0, {(iL + iNwin) % Ow}, context);
-  // Value modSum = affine::makeComposedAffineApply(b, loc, mapModSum, {iLstart, kIndex, nwinIndex});
+  // AffineMap Hw1Map = AffineMap::get(4, 0, {hw1Expr}, context);
+  // Value iHW_1 = affine::makeComposedAffineApply(b, loc, Hw1Map, {nIndex, kIndex, nwinIndex, iLstart});
   //
-  // // (i_K mod (Fh * Fw)) / Fw
-  // AffineMap mapDivHW = AffineMap::get(3, 0, {(iK % filterHW).floorDiv(Fw)}, context);
-  // Value divHW = affine::makeComposedAffineApply(b, loc, mapDivHW, {nIndex, kIndex, nwinIndex});
+  // // iHW_2 = ((iL + iNwin) % Ow - iL % Ow) * strideW + (iK % Fw)
+  // AffineExpr hw2Expr = ((iL + iNwin) % Ow - iL % Ow) * strideW + (iK % Fw);
   //
-  // // (4) i_Lstart / OW
-  // AffineMap mapDivStart = AffineMap::get(3, 0, {iL.floorDiv(Ow)}, context);
-  // Value divStart = affine::makeComposedAffineApply(b, loc, mapDivStart, {iLstart, kIndex, nwinIndex});
+  // AffineMap Hw2Map = AffineMap::get(4, 0, {hw2Expr}, context);
+  // Value iHW_2 = affine::makeComposedAffineApply(b, loc, Hw2Map, {nIndex, kIndex, nwinIndexi, iLstart});
   //
-  // // (5) i_Lstart % OW
-  // AffineMap mapModStart = AffineMap::get(3, 0, {iL % Ow}, context);
-  // Value modStart = affine::makeComposedAffineApply(b, loc, mapModStart, {iLstart, kIndex, nwinIndex});
-  //
-  // // deltaDiv = (iL + iNwin)/Ow - iL/Ow
-  // Value deltaDiv = b.create<arith::SubIOp>(loc, divSum, divStart);
-  //
-  // // deltaMod = (iL + iNwin) % Ow - iL % Ow
-  // Value deltaMod = b.create<arith::SubIOp>(loc, modSum, modStart);
-  //
-  // // strideH & strideW as Value
-  // Value strideHVal = b.create<arith::ConstantIndexOp>(loc, strideH);
-  // Value strideWVal = b.create<arith::ConstantIndexOp>(loc, strideW);
-  //
-  // Value part1 = b.create<arith::MulIOp>(loc, deltaDiv, strideHVal);
-  // Value part2 = b.create<arith::AddIOp>(loc, part1, divHW);
-  // Value part3 = b.create<arith::MulIOp>(loc, part2, strideHVal);
-  // Value part4 = b.create<arith::MulIOp>(loc, deltaMod, strideWVal);
-  //
-  // // i_K mod Fw
-  // AffineMap mapModFW = AffineMap::get(3, 0, {iK % Fw}, context);
-  // Value modF = affine::makeComposedAffineApply(b, loc, mapModFW, {nIndex, kIndex, nwinIndex});
-  //
-  // // Final sum
-  // Value sumFinal = b.create<arith::AddIOp>(loc, part3, part4);
-  // Value HwIndex = b.create<arith::AddIOp>(loc, sumFinal, modF);
+  // // iHW = iHW_1 + iHW_2
+  // AffineExpr d0, d1;
+  // bindDims(context, d0, d1);
+  // AffineMap mapAdd = AffineMap::get(2, 0, {d0 + d1}, context);
+  // Value HwIndex = affine::makeComposedAffineApply(b, loc, mapAdd, {iHW_1, iHW_2});
 
   return {NcIndex, HwIndex};
 }

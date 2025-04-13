@@ -159,7 +159,7 @@ static Value computeFilterIndices(OpBuilder &b, Location loc, Value oIndex,
 }
 
 // Compute the linearized input indices considering strides and tensor structure.
-static SmallVector<Value, 3> computeLinearInputIndices(
+static SmallVector<Value, 2> computeLinearInputIndices(
     OpBuilder &b, Location loc, Value kIndex, Value nwinIndex, Value iLstart,
     int64_t Fh, int64_t Fw, int64_t Ow, int64_t Iw,
     SmallVector<int64_t, 2> strides) {
@@ -173,9 +173,10 @@ static SmallVector<Value, 3> computeLinearInputIndices(
   int64_t strideW = strides[1];
 
   //  NcIndex (iNc) = iK floorDiv (Fh * Fw)
-  AffineMap NcMap = AffineMap::get(3, 0, {iK.floorDiv(Fh * Fw)}, context);
+  AffineMap NcMap = AffineMap::get(3, 0, {iK.floorDiv(filterHW)}, context);
   Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {iLstart, kIndex, nwinIndex});
 
+  // HwIndex
   AffineExpr iHwExpr =
     (((((iL + iNwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH) +
        ((iK % filterHW).floorDiv(Fw))) * Iw) +
@@ -225,8 +226,7 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   MLIRContext *context = rewriter.getContext();
 
   // Validate input loops
-  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
-  int idx = (res.tile_c == 0) ? 3 : 4;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
@@ -347,8 +347,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
                  CSAStrategy res, SmallVector<Operation *> loopOps) {
 
   // Validate input loops
-  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
-  int idx = (res.tile_c == 0) ? 3 : 4;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
@@ -440,8 +439,7 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
   MLIRContext *context = rewriter.getContext();
 
   // select the loop based on IS or WS
-  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
-  int idx = (res.tile_c == 0) ? 3 : 4;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   int loopIndex = res.schd == IS ? idx+1 : idx;
 
   // Cast to scf::ForOp the  selected loop
@@ -536,12 +534,12 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
 
   MLIRContext *context = rewriter.getContext();
 
-  int idx = (res.tile_c == 0) ? 3 : 4;
-  // select the loop based on IS or WS
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  // select the loops based on IS or WS
   int loopIndex = res.schd == IS ? idx : idx+1;
-  int outerIndex = 2; /* Always ?? */
+  int outerIndex = res.schd == IS ? 2 : 3;
 
-  // Cast to scf::ForOp the  selected loop
+  // Cast to scf::ForOp the inner loop
   auto loopOp = dyn_cast<scf::ForOp>(loopOps[loopIndex]);
   if (!loopOp) return transformOp->emitError("failed to get the inner scf::for op");
   Block *loopBody = loopOp.getBody();
@@ -551,7 +549,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
 
   // Cast to linalg::GenericOp to get the input & filter, types & shapes
   auto linalgOp = dyn_cast<linalg::GenericOp>(convOp);
-  if (!linalgOp) return transformOp->emitError("failed to get the inner convOp");
+  if (!linalgOp) return transformOp->emitError("failed to get the uKernel");
 
   // Locate the insertion point (scf::for Op if IS or linalg::generic Op if WS)
   Location loc = linalgOp.getLoc(); // location should never be null.
@@ -563,7 +561,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
         break;
       }
     }
-    if (!innerLoop) return transformOp->emitError("failed to get the inner forOp");
+    if (!innerLoop) return transformOp->emitError("failed to get the inner loop");
     rewriter.setInsertionPoint(innerLoop);
     loc = innerLoop->getLoc();
   }
@@ -588,7 +586,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
 
   int64_t n = inputShape[0];
   int64_t ic = inputShape[1];
-  int64_t iw = csaConv.input_cols;
+  int64_t iw = csaConv.input_cols; // The iw of the original input
   int64_t fh = filterShape[2];
   int64_t fw = filterShape[3];
   int64_t oh = outputShape[1];
@@ -652,8 +650,7 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
 
   if (res.schd != IS) return success();
 
-  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
-  int idx = (res.tile_c == 0) ? 3 : 4;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   if (!outerLoop || !innerLoop)
@@ -720,8 +717,7 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
 
   MLIRContext *context = rewriter.getContext();
 
-  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
-  int idx = (res.tile_c == 0) ? 2 : 3;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
   auto nestLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+2]);
@@ -755,7 +751,6 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
 
   // Last, create the inputMultiPacking with shape {Ni, Ti, K, Nwin} 
   // where Ti = res.k2, K = Nc * Fh * Fw, Nwin = csa.mK_.nwindows
-  
   auto oper0Type = cast<ShapedType>(inputSlice->getOperand(0).getType());
   auto oper0Shape = oper0Type.getShape(); // Used to do a workaround. See comment below
 
@@ -911,7 +906,7 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
       break;
   }
 
-  // Remove the obsolet ops
+  // Remove obsolet ops
   SmallVector<Operation *, 4> opsToRemove;
   opsToRemove.push_back(emptyOp);
   opsToRemove.push_back(affineApply2);
@@ -949,8 +944,7 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   MLIRContext *context = rewriter.getContext();
 
-  // int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
-  int idx = (res.tile_c == 0) ? 2 : 3;
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 2 : 3;
   auto nestLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+2]);
@@ -1103,7 +1097,7 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
     emptyOp = op;
   });
 
-  // Remove the obsolet ops
+  // Remove obsolet ops
   SmallVector<Operation *, 4> opsToRemove;
   opsToRemove.push_back(emptyOp);
   opsToRemove.push_back(extractedSlice); 
@@ -1165,7 +1159,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   FailureOr<scf::SCFTilingResult> tiledResults =
       scf::tileUsingSCF(rewriter, tilingInterfaceOp, tilingOptions);
   if (failed(tiledResults))
-    return transformOp->emitError("failed the outermost tile operation");
+    return transformOp->emitError("Outermost tiling operation was failed ");
 
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(tilingInterfaceOp, tiledResults->loops.empty()
@@ -1193,7 +1187,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   FailureOr<scf::SCFTilingResult> innerTiledResults =
       scf::tileUsingSCF(rewriter, innerTilingInterfaceOp, innerTilingOptions);
   if (failed(innerTiledResults))
-    return transformOp->emitError("failed the innermost tile operation");
+    return transformOp->emitError("Innermost tiling operation was failed ");
 
   // Perform the replacement of tiled and fused values.
   rewriter.replaceOp(innerTilingInterfaceOp, innerTiledResults->loops.empty()
@@ -1207,6 +1201,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   for (Operation *loop : innerTiledResults->loops)
     loopOps.push_back(loop);
 
+  // For debug only:
   // auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
   // llvm::errs() << "Loops after tiling: \n" << rootLoop << "\n\n";
 
@@ -1241,7 +1236,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   // Store the results (Operation*) in the output variable (as Value)
   outResults.push_back(tiledOps.front());  // The head is the linalg.generic (uKernel)
   for (auto &loop : loopOps)
-    outResults.push_back(loop);  // The tail is the loops
+    outResults.push_back(loop);  // The tail contain the loops
 
   return success();
 }
@@ -1265,6 +1260,7 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
   auto offset = iterationSpace[dim].offset;
   auto size = iterationSpace[dim].size;
 
+  // for debug only:
   llvm::errs() << "=== Iteration Domain Sizes ===\n";
   for (unsigned i = 0; i < iterationSpace.size(); ++i) {
     llvm::errs() << "Dim " << i << ": ";
@@ -1369,14 +1365,12 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
     splitDim = res.schd == WS ? 2 : 1;
     extraSize = res.schd == WS ? csa.mK_.nwindows * res.extra_k2 : csa.mK_.num_filters * res.extra_k2;
     splitSize = csaConv.output_rows * csaConv.output_cols - extraSize;
-    // split_res.k2 = 0;
     split_res.k2 = res.extra_k2;
   }
   else if (res.extra_k3 != 0) {
     splitDim = res.schd == IS ? 2 : 1;
     extraSize = res.schd == IS ? csa.mK_.nwindows * res.extra_k3 : csa.mK_.num_filters * res.extra_k3;
     splitSize = csaConv.output_rows * csaConv.output_cols - extraSize;
-    // split_res.k3 = 0;
     split_res.k3 = res.extra_k3;
   }
 
@@ -1386,10 +1380,11 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   }
   auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
+  // For debug only:
   llvm::errs() << "=== Splitted kernels ===\n";
-  llvm::errs() << "First One :\n ";
+  llvm::errs() << "First :\n ";
   firstOp.print(llvm::errs());
-  llvm::errs() << "Last One :\n ";
+  llvm::errs() << "\nLast :\n ";
   secondOp.print(llvm::errs());
 
   // Apply the tiling for each part of the split
@@ -1407,6 +1402,7 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   }
   resultLoops.push_back(firstLoopSet);
 
+  // For debug only:
   // auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
   // llvm::errs() << "Loops after tiling for first convOp: \n" << root1Loop << "\n\n";
 
@@ -1420,6 +1416,7 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   }
   resultLoops.push_back(secondLoopSet);
 
+  // For debug only:
   // auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
   // llvm::errs() << "Loops after tiling for second convOp: \n" << root2Loop << "\n\n";
 
@@ -1541,7 +1538,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     if (!inputType.hasStaticShape())
       return emitSilenceableError() << "expected a static shape for the input";
 
-    // Does not support dilation.
+    // SConv do not support dilation, for now.
     if (!hasAllOneValues(convOp.getDilations()))
       return emitSilenceableError() << "expected all ones for dilations";
 
@@ -1558,13 +1555,13 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     int64_t oh = outputShape[2];
     int64_t ow = outputShape[3];
 
-    // Create the Collapse shape of input tensor
+    // Create the Collapsed shape of input tensor
     SmallVector<ReassociationIndices> inputReassocIndices = {{0}, {1}, {2, 3}};
     auto reshapedInputType = RankedTensorType::get({n, ic, ih * iw}, inputType.getElementType());
     Value reshapedInput = rewriter.create<tensor::CollapseShapeOp>(
         loc, reshapedInputType, input, inputReassocIndices);
 
-    // Create the Collapse shape of output tensor
+    // Create the Collapsed shape of output tensor
     SmallVector<ReassociationIndices> outputReassocIndices = {{0}, {1}, {2, 3}};
     auto reshapedOutputType = RankedTensorType::get({n, oc, oh * ow}, outputType.getElementType());
     Value reshapedOutput = rewriter.create<tensor::CollapseShapeOp>(
@@ -1575,12 +1572,12 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     auto reduction = utils::IteratorType::reduction;
     SmallVector<utils::IteratorType> newOpIterators = {parallel, parallel, parallel, reduction, reduction, reduction};
 
-    // Get strides
+    // Get the strides
     auto hstride = convOp.getStrides().getValues<int64_t>()[0];
     auto wstride = convOp.getStrides().getValues<int64_t>()[1];
     SmallVector<int64_t, 2> strides = {hstride, wstride};
 
-    // definitions:
+    // Affine Expr definitions:
     // d0 = batch; d1 = filter; d2 = output height; d3 = output width; d4 = channels; d5 = filter height; d6 = filter width
 
     AffineExpr d0, d1, d3, d4, d5, d6;
@@ -1615,12 +1612,12 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     CSAStrategy res = csa();
     
     // Apply the split (if necessary) & tiling in the genericOp based on the CSA Analysis
-    // bool requiresSplit = (res.extra_k2 != 0) || (res.extra_k3 != 0) || (res.extra_tile_c != 0);
-    // if (requiresSplit) {
-    //   if (failed(splitAndTileConvolution(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, tempResultLoops, tempResultConvs)))
-    //     return emitSilenceableError() << "Failed to apply split & tiling to the convolution operation";
-    // }
-    // else {
+    bool requiresSplit = (res.extra_k2 != 0) || (res.extra_k3 != 0) || (res.extra_tile_c != 0);
+    if (requiresSplit) {
+      if (failed(splitAndTileConvolution(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, tempResultLoops, tempResultConvs)))
+        return emitSilenceableError() << "Failed to apply split & tiling to the convolution operation";
+    }
+    else {
       SmallVector<Operation*, 7> localResults;
       if (failed(applyTileTo(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, localResults)))
         return emitSilenceableError() << "Failed to apply tiling to one of the convolution operations";
@@ -1631,7 +1628,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
       for (int i = 1; i <= 6; ++i)
         loopSet.push_back(localResults[i]);
       tempResultLoops.push_back(loopSet);
-    // }
+    }
   }
 
   // Flatten tempResultLoops

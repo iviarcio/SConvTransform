@@ -160,31 +160,49 @@ static Value computeFilterIndices(OpBuilder &b, Location loc, Value oIndex,
 
 // Compute the linearized input indices considering strides and tensor structure.
 static SmallVector<Value, 2> computeLinearInputIndices(
-    OpBuilder &b, Location loc, Value kIndex, Value nwinIndex, Value iLstart,
-    int64_t Fh, int64_t Fw, int64_t Ow, int64_t Iw,
+    OpBuilder &b, Location loc, Value kIndex, Value nwinIndex, Value IOin,
+    Value IOout, Value ILss, int64_t Fh, int64_t Fw, int64_t Ow, int64_t Iw, 
     SmallVector<int64_t, 2> strides) {
 
   MLIRContext *context = b.getContext();
-  AffineExpr iL, iK, iNwin;
-  bindDims(context, iL, iK, iNwin);
 
   int64_t filterHW = Fh * Fw;
   int64_t strideH = strides[0];
   int64_t strideW = strides[1];
 
-  //  NcIndex (iNc) = iK floorDiv (Fh * Fw)
-  AffineMap NcMap = AffineMap::get(3, 0, {iK.floorDiv(filterHW)}, context);
-  Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {iLstart, kIndex, nwinIndex});
+  // Compute NcIndex (iNc) = iK floorDiv (Fh * Fw)
+  AffineExpr d0;
+  bindDims(context, d0);
+  AffineMap NcMap = AffineMap::get(1, 0, {d0.floorDiv(filterHW)}, context);
+  Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {kIndex});
 
-  // HwIndex
+  // Compute ILstart = IOin + IOout + ILss
+  AffineExpr d1, d2, s0;
+  bindDims(context, d1, d2);
+  bindSymbols(context, s0);
+  AffineMap ILstartMap = AffineMap::get(2, 1, {d1 + d2 + s0}, context);
+  Value ILstart = affine::makeComposedAffineApply(b, loc, ILstartMap, {IOin, IOout, ILss});
+
+  llvm::errs() << "\niLstartMap:\n";
+  ILstartMap.print(llvm::errs());
+  llvm::errs() << "\n";
+
+  // HwIndex using ILstart
+  AffineExpr iL, k, nwin;
+  bindDims(context, iL, k, nwin);
   AffineExpr iHwExpr =
-    (((((iL + iNwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH) +
-       ((iK % filterHW).floorDiv(Fw))) * Iw) +
-    (((iL + iNwin) % Ow - iL % Ow) * strideW) +
-    (iK % Fw);
+    ((((iL + nwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH) +
+     ((k % filterHW).floorDiv(Fw))) * Iw +
+    (((iL + nwin) % Ow - iL % Ow) * strideW) +
+    (k % Fw);
 
   AffineMap iHwMap = AffineMap::get(3, 0, {iHwExpr}, context);
-  Value HwIndex = affine::makeComposedAffineApply(b, loc, iHwMap, {iLstart, kIndex, nwinIndex});
+
+  llvm::errs() << "\niHwMap:\n";
+  iHwMap.print(llvm::errs());
+  llvm::errs() << "\n";
+
+  Value HwIndex = affine::makeComposedAffineApply(b, loc, iHwMap, {ILstart, kIndex, nwinIndex});
 
   return {NcIndex, HwIndex};
 }
@@ -434,7 +452,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
 // second loop level of the internal convolution depends of Input or Wheight Stationary
 static LogicalResult
 applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
-                  SmallVector<Operation *> tiledOps, SmallVector<Operation *> loopOps) {
+                  SmallVector<Operation *> &tiledOps, SmallVector<Operation *> loopOps) {
 
   MLIRContext *context = rewriter.getContext();
 
@@ -530,7 +548,7 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
 static LogicalResult
 applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv,
                   CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides,
-                  SmallVector<Operation *> tiledOps, SmallVector<Operation *> loopOps) {
+                  SmallVector<Operation *> &tiledOps, SmallVector<Operation *> loopOps) {
 
   MLIRContext *context = rewriter.getContext();
 
@@ -597,23 +615,17 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
   SmallVector<int64_t, 3> inputPackingShape = {n, ic * fh * fw, nw};
   Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());
 
-  // Compute the iL_start = iO_out + iO_in where:
-  // iO_out = the outermost output tiling loop iterator
-  // iO_in = the innermost output tiling loop iterator 
-  Value iO_out = dyn_cast<scf::ForOp>(loopOps[outerIndex]).getInductionVar();
-  Value iO_in  = dyn_cast<scf::ForOp>(loopOps[loopIndex]).getInductionVar();
-
-  AffineExpr d0, d1;
-  bindDims(context, d0, d1);
-  AffineMap mapStart = AffineMap::get(2, 0, {d0 + d1}, context);
-  Value iLstart = affine::makeComposedAffineApply(rewriter, loc, mapStart, {iO_out, iO_in});
-
   auto nloops = inputPackingShape.size();
   auto parallel = utils::IteratorType::parallel;
   SmallVector<utils::IteratorType, 3> packingIterators(nloops, parallel);
   SmallVector<AffineMap, 3> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
 
   // create the input packing
+
+  Value IO_in  = dyn_cast<scf::ForOp>(loopOps[loopIndex]).getInductionVar();
+  Value IO_out = dyn_cast<scf::ForOp>(loopOps[outerIndex]).getInductionVar();
+  Value IL_ss = rewriter.create<arith::ConstantIndexOp>(loc, csaConv.split_size);
+
   auto packingTensor = rewriter.create<linalg::GenericOp>(
     loc, inputPacking.getType(),
     /*inputs=*/ValueRange{}, /*outputs=*/inputPacking, packingIndexingMaps,
@@ -625,7 +637,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
       Value iNwin = nestedBuilder.create<linalg::IndexOp>(loc, 2); // nw
 
       SmallVector<Value, 2> inputIndices = computeLinearInputIndices(
-          nestedBuilder, nestedLoc, iK, iNwin, iLstart, fh, fw, ow, iw, strides);
+          nestedBuilder, nestedLoc, iK, iNwin, IO_in, IO_out, IL_ss, fh, fw, ow, iw, strides);
       Value iNc = inputIndices[0];
       Value iHw = inputIndices[1];
 
@@ -646,7 +658,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
 // Apparently, scf::tileUsingSCF innerInterchange has no effect!
 static LogicalResult
 swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
-                  SmallVector<Operation *> tiledOps, SmallVector<Operation *> &loopOps) {
+                  SmallVector<Operation *> &tiledOps, SmallVector<Operation *> &loopOps) {
 
   if (res.schd != IS) return success();
 
@@ -1202,8 +1214,8 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
     loopOps.push_back(loop);
 
   // For debug only:
-  // auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  // llvm::errs() << "Loops after tiling: \n" << rootLoop << "\n\n";
+  auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  llvm::errs() << "\n=== Loops after tiling === \n" << rootLoop << "\n\n";
 
   // Swap the innner loops in the case of Input Stationary
   LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
@@ -1392,6 +1404,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   
   rewriter.setInsertionPoint(target);
 
+  // In the prologue split, csaConv.split_size equals 0
+  csaConv.split_size = 0;
   if (failed(applyTileTo(rewriter, transformOp, firstOp, csaConv, csa, res, strides, firstResults))) {
     return transformOp->emitError("Failed to apply tiling on first convOp after split.");
   }
@@ -1406,6 +1420,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   // auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
   // llvm::errs() << "Loops after tiling for first convOp: \n" << root1Loop << "\n\n";
 
+  // In the epilogue split, csaConv.split_size equals splitSize
+  csaConv.split_size = splitSize;
   if (failed(applyTileTo(rewriter, transformOp, secondOp, csaConv, csa, split_res, strides, secondResults))) {
     return transformOp->emitError("Failed to apply tiling on second convOp after split.");
   }
@@ -1607,7 +1623,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
 
     // Call the CSA Analysis
-    ConvInfo csaConv = {ic, iw, oh, ow, fh, fw, oc, 4};
+    ConvInfo csaConv = {ic, iw, oh, ow, fh, fw, oc, 0, 4};
     CSA csa = createCSAPass(arch, csaConv, mK);
     CSAStrategy res = csa();
     
@@ -1619,6 +1635,8 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     }
     else {
       SmallVector<Operation*, 7> localResults;
+      // If no split then csaConv.split_size equals 0
+      csaConv.split_size = 0;
       if (failed(applyTileTo(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, localResults)))
         return emitSilenceableError() << "Failed to apply tiling to one of the convolution operations";
       // The first result is the transformed linalg.generic (uKernel)

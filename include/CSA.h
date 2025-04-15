@@ -13,6 +13,7 @@ typedef struct {
   int64_t kernel_rows;
   int64_t kernel_cols;
   int64_t num_filters;
+  int64_t split_size;
   uint8_t data_size; // bytes -- 4 (4B)
 } ConvInfo;
 

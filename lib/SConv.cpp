@@ -183,26 +183,21 @@ static SmallVector<Value, 2> computeLinearInputIndices(
   AffineMap ILstartMap = AffineMap::get(2, 1, {d1 + d2 + s0}, context);
   Value ILstart = affine::makeComposedAffineApply(b, loc, ILstartMap, {IOin, IOout, ILss});
 
-  llvm::errs() << "\niLstartMap:\n";
-  ILstartMap.print(llvm::errs());
-  llvm::errs() << "\n";
+  // Compute Hwindex (iHw) using ILstart as symbol
+  AffineExpr k, nwin, s_ilstart;
+  bindDims(context, k, nwin);
+  bindSymbols(context, s_ilstart);
+  AffineExpr iHwExpr = 
+      ((((s_ilstart + nwin).floorDiv(Ow) - s_ilstart.floorDiv(Ow)) * strideH) +
+       ((k % filterHW).floorDiv(Fw))) * Iw +
+      (((s_ilstart + nwin) % Ow - s_ilstart % Ow) * strideW) +
+      (k % Fw);
 
-  // HwIndex using ILstart
-  AffineExpr iL, k, nwin;
-  bindDims(context, iL, k, nwin);
-  AffineExpr iHwExpr =
-    ((((iL + nwin).floorDiv(Ow) - iL.floorDiv(Ow)) * strideH) +
-     ((k % filterHW).floorDiv(Fw))) * Iw +
-    (((iL + nwin) % Ow - iL % Ow) * strideW) +
-    (k % Fw);
-
-  AffineMap iHwMap = AffineMap::get(3, 0, {iHwExpr}, context);
-
-  llvm::errs() << "\niHwMap:\n";
-  iHwMap.print(llvm::errs());
-  llvm::errs() << "\n";
-
-  Value HwIndex = affine::makeComposedAffineApply(b, loc, iHwMap, {ILstart, kIndex, nwinIndex});
+  AffineMap iHwMap = AffineMap::get(2, 1, {iHwExpr}, context);
+  Value HwIndex = b.create<affine::AffineApplyOp>(
+      loc, 
+      iHwMap,
+      ValueRange{kIndex, nwinIndex, ILstart});
 
   return {NcIndex, HwIndex};
 }
@@ -621,14 +616,15 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
   SmallVector<AffineMap, 3> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
 
   // create the input packing
-
   Value IO_in  = dyn_cast<scf::ForOp>(loopOps[loopIndex]).getInductionVar();
   Value IO_out = dyn_cast<scf::ForOp>(loopOps[outerIndex]).getInductionVar();
   Value IL_ss = rewriter.create<arith::ConstantIndexOp>(loc, csaConv.split_size);
 
   auto packingTensor = rewriter.create<linalg::GenericOp>(
     loc, inputPacking.getType(),
-    /*inputs=*/ValueRange{}, /*outputs=*/inputPacking, packingIndexingMaps,
+    /*inputs=*/ValueRange{},
+    /*outputs=*/inputPacking,
+    packingIndexingMaps,
     packingIterators,
 
     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {

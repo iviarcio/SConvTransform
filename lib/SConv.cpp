@@ -603,7 +603,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
   int64_t fh = filterShape[2];
   int64_t fw = filterShape[3];
   int64_t oh = outputShape[1];
-  int64_t ow = outputShape[2];
+  int64_t ow = csaConv.output_cols; // The ow of the orignal output
   int64_t nw = csa.mK_.nwindows;
 
   // Compute the Packed Input Shape: {n, ic × fh × fw, nw}

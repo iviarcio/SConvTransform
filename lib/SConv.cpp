@@ -356,77 +356,104 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
 // After the inner tile operation, promote the two affine.apply and the first extracted
 // slice if chd = IS or the second extracted slice if schd = WS, to the outer loop
 static LogicalResult
-promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
-                 CSAStrategy res, SmallVector<Operation *> loopOps) {
+promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv,
+                 CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<Operation *> loopOps) {
 
   // Validate input loops
   int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  auto root2Loop = dyn_cast<scf::ForOp>(loopOps[idx-1]);
   auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
   auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
-  if (!outerLoop || !innerLoop)
+  if (!root2Loop || !outerLoop || !innerLoop)
     return transformOp->emitError("Loops must be scf.for");
 
   // Get the body of the loops
+  Block *root2Body = root2Loop.getBody();
   Block *outerBody = outerLoop.getBody();
   Block *innerBody = innerLoop.getBody();
 
+  Operation *affineApply0 = nullptr;
   Operation *affineApply1 = nullptr;
-  // Operation *affineApply2 = nullptr;
   Operation *tensorExtractSlice1 = nullptr;
   Operation *tensorExtractSlice2 = nullptr;
+
+  // Locate the affine operation within the root2 loop body
+  for (Operation &op : root2Body->getOperations()) {
+    if (!affineApply0 && isa<AffineApplyOp>(&op))
+      affineApply0 = &op;
+    if (affineApply0)
+      break;
+  }
 
   // Locate the target operations within the inner loop body
   for (Operation &op : innerBody->getOperations()) {
     if (!affineApply1 && isa<AffineApplyOp>(&op))
       affineApply1 = &op;
-    // else if (!affineApply2 && isa<AffineApplyOp>(&op))
-    //   affineApply2 = &op;
     else if (!tensorExtractSlice1 && isa<tensor::ExtractSliceOp>(&op))
       tensorExtractSlice1 = &op;
     else if (!tensorExtractSlice2 && isa<tensor::ExtractSliceOp>(&op))
       tensorExtractSlice2 = &op;
 
     // Stop once all target operations are found
-    // if (affineApply1 && affineApply2 && tensorExtractSlice1 && tensorExtractSlice2)
     if (affineApply1 && tensorExtractSlice1 && tensorExtractSlice2)
       break;
   }
 
-  // if (!affineApply1 || !affineApply2 || !tensorExtractSlice1 || !tensorExtractSlice2)
-  if (!affineApply1 || !tensorExtractSlice1 || !tensorExtractSlice2)
+  if (!affineApply0 || !affineApply1 || !tensorExtractSlice1 || !tensorExtractSlice2)
     return transformOp->emitError("Failed to hosting Ops");
+
+  // Set insertion point at the start of root2 loop
+  rewriter.setInsertionPointToStart(root2Body);
+
+  // Get context
+  MLIRContext *context = rewriter.getContext();
+
+  // Get some common values for both transformations
+  Value inputValue0 = affineApply0->getOperand(0);
+  int64_t iw = csaConv.input_cols;
+  int64_t ow = csaConv.output_cols;
+  int64_t strideH = strides[0];
+  int64_t strideW = strides[1];
+
+  // Modify first affine op
+  Operation *modifiedAffineApply0 = nullptr;
+  if (res.schd == IS) {
+    AffineExpr d0;
+    bindDims(context, d0);
+    AffineExpr m0Expr = ((d0.floorDiv(ow)) * strideH) * iw + ((d0 % ow) * strideW);
+    AffineMap m0Map = AffineMap::get(1, 0, {m0Expr}, context);
+    modifiedAffineApply0 = rewriter.create<AffineApplyOp>(affineApply0->getLoc(), m0Map, inputValue0);
+  }
 
   // Set insertion point at the start of outer loop
   rewriter.setInsertionPointToStart(outerBody);
 
   Operation *promotedAffineApply1 = nullptr;
-  // Operation *promotedAffineApply2 = nullptr;
   Operation *promotedTensorExtractSlice1 = nullptr;
   Operation *promotedTensorExtractSlice2 = nullptr;
 
   // Clone operations to the outer loop
   if (res.schd == IS) {
-    SmallVector<Value, 1> outIndVar1 = {outerLoop.getInductionVar()};
-    promotedAffineApply1 = rewriter.create<AffineApplyOp>(
-      affineApply1->getLoc(), affineApply1->getAttrOfType<AffineMapAttr>("map"), outIndVar1);
-
-    // SmallVector<Value, 1> outIndVar2 = {outerLoop.getInductionVar()};
-    // promotedAffineApply2 = rewriter.create<AffineApplyOp>(
-    //   affineApply2->getLoc(), affineApply2->getAttrOfType<AffineMapAttr>("map"), outIndVar2);
-
+    Value outIndVar1 = outerLoop.getInductionVar();
+    AffineExpr d1, s0;
+    bindDims(context, d1);
+    bindSymbols(context, s0);
+    AffineExpr m1Expr = ((((d1 + s0).floorDiv(ow) - s0.floorDiv(ow)) * strideH) * iw + ((d1 + s0) % ow - s0 % ow) * strideW);
+    AffineMap m1Map = AffineMap::get(1, 1, {m1Expr}, context);
+    promotedAffineApply1 = rewriter.create<AffineApplyOp>(affineApply1->getLoc(), m1Map, ValueRange{outIndVar1, inputValue0});
     promotedTensorExtractSlice1 = rewriter.clone(*tensorExtractSlice1);
   }
   else {
     promotedTensorExtractSlice2 = rewriter.clone(*tensorExtractSlice2);
   }
 
-  // Replace uses of the old operations starting at the outer loop body
-  outerBody->walk([&](Operation *op) {
+  // Replace uses of the old operations starting at the root2 loop body
+  root2Body->walk([&](Operation *op) {
     for (auto &operand : op->getOpOperands()) {
-      if (res.schd == IS && operand.get() == affineApply1->getResult(0))
+      if (res.schd == IS && operand.get() == affineApply0->getResult(0))
+        operand.set(modifiedAffineApply0->getResult(0));
+      else if (res.schd == IS && operand.get() == affineApply1->getResult(0))
         operand.set(promotedAffineApply1->getResult(0));
-      // else if (res.schd == IS && operand.get() == affineApply2->getResult(0))
-      //   operand.set(promotedAffineApply2->getResult(0));
       else if (res.schd == IS && operand.get() == tensorExtractSlice1->getResult(0))
         operand.set(promotedTensorExtractSlice1->getResult(0));
       else if (res.schd == WS && operand.get() == tensorExtractSlice2->getResult(0))
@@ -435,8 +462,8 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp,
   });
 
   // Erase the old operations
+  if (affineApply0->use_empty()) rewriter.eraseOp(affineApply0);
   if (affineApply1->use_empty()) rewriter.eraseOp(affineApply1);
-  // if (affineApply2->use_empty()) rewriter.eraseOp(affineApply2);
   if (tensorExtractSlice1->use_empty()) rewriter.eraseOp(tensorExtractSlice1);
   if (tensorExtractSlice2->use_empty()) rewriter.eraseOp(tensorExtractSlice2);
 
@@ -1209,17 +1236,20 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   for (Operation *loop : innerTiledResults->loops)
     loopOps.push_back(loop);
 
-  // For debug only:
-  auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  llvm::errs() << "\n=== Loops after tiling === \n" << rootLoop << "\n\n";
-
   // Swap the innner loops in the case of Input Stationary
   LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
 
+  // For debug only:
+  auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  llvm::errs() << "\n=== Loops after tiling & swapInductionVars === \n" << rootLoop << "\n\n";
+
   // Promote some inner loop Ops depending on the schedule (WS or IS)
-  LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, res, loopOps);
+  LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, csaConv, res, strides, loopOps);
   if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
+
+  // For debug only:
+  llvm::errs() << "\n=== Loops after tiling & promoteOpsOfTile === \n" << rootLoop << "\n\n";
 
   // // Generate the filter packing
   LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);

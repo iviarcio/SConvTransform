@@ -355,6 +355,7 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
 
 // After the inner tile operation, promote the two affine.apply and the first extracted
 // slice if chd = IS or the second extracted slice if schd = WS, to the outer loop
+// Also, fix the maps of both AffineApplyOp of the linearized input
 static LogicalResult
 promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv,
                  CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<Operation *> loopOps) {
@@ -377,7 +378,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
   Operation *tensorExtractSlice1 = nullptr;
   Operation *tensorExtractSlice2 = nullptr;
 
-  // Locate the affine operation within the root2 loop body
+  // Get the (only) affine operation at the root2 loop body
   for (Operation &op : root2Body->getOperations()) {
     if (!affineApply0 && isa<AffineApplyOp>(&op))
       affineApply0 = &op;
@@ -385,7 +386,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
       break;
   }
 
-  // Locate the target operations within the inner loop body
+  // Get the target operations (affineApply & extractedSlice) in the inner loop body
   for (Operation &op : innerBody->getOperations()) {
     if (!affineApply1 && isa<AffineApplyOp>(&op))
       affineApply1 = &op;
@@ -408,22 +409,20 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
   // Get context
   MLIRContext *context = rewriter.getContext();
 
-  // Get some common values for both transformations
+  // Get some common values used by both map replacements
   Value inputValue0 = affineApply0->getOperand(0);
   int64_t iw = csaConv.input_cols;
   int64_t ow = csaConv.output_cols;
   int64_t strideH = strides[0];
   int64_t strideW = strides[1];
 
-  // Modify first affine op
+  // Modify the first Affine op with new (fixed) map
   Operation *modifiedAffineApply0 = nullptr;
-  if (res.schd == IS) {
-    AffineExpr d0;
-    bindDims(context, d0);
-    AffineExpr m0Expr = ((d0.floorDiv(ow)) * strideH) * iw + ((d0 % ow) * strideW);
-    AffineMap m0Map = AffineMap::get(1, 0, {m0Expr}, context);
-    modifiedAffineApply0 = rewriter.create<AffineApplyOp>(affineApply0->getLoc(), m0Map, inputValue0);
-  }
+  AffineExpr d0;
+  bindDims(context, d0);
+  AffineExpr m0Expr = ((d0.floorDiv(ow)) * strideH) * iw + ((d0 % ow) * strideW);
+  AffineMap m0Map = AffineMap::get(1, 0, {m0Expr}, context);
+  modifiedAffineApply0 = rewriter.create<AffineApplyOp>(affineApply0->getLoc(), m0Map, inputValue0);
 
   // Set insertion point at the start of outer loop
   rewriter.setInsertionPointToStart(outerBody);
@@ -432,27 +431,32 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
   Operation *promotedTensorExtractSlice1 = nullptr;
   Operation *promotedTensorExtractSlice2 = nullptr;
 
+  AffineExpr d1, s0;
+  bindDims(context, d1);
+  bindSymbols(context, s0);
+  AffineExpr m1Expr = ((((d1 + s0).floorDiv(ow) - s0.floorDiv(ow)) * strideH) * iw + ((d1 + s0) % ow - s0 % ow) * strideW);
+  AffineMap m1Map = AffineMap::get(1, 1, {m1Expr}, context);
+
   // Clone operations to the outer loop
   if (res.schd == IS) {
     Value outIndVar1 = outerLoop.getInductionVar();
-    AffineExpr d1, s0;
-    bindDims(context, d1);
-    bindSymbols(context, s0);
-    AffineExpr m1Expr = ((((d1 + s0).floorDiv(ow) - s0.floorDiv(ow)) * strideH) * iw + ((d1 + s0) % ow - s0 % ow) * strideW);
-    AffineMap m1Map = AffineMap::get(1, 1, {m1Expr}, context);
     promotedAffineApply1 = rewriter.create<AffineApplyOp>(affineApply1->getLoc(), m1Map, ValueRange{outIndVar1, inputValue0});
     promotedTensorExtractSlice1 = rewriter.clone(*tensorExtractSlice1);
   }
   else {
     promotedTensorExtractSlice2 = rewriter.clone(*tensorExtractSlice2);
+    // Set insertion point at the start of inner loop
+    rewriter.setInsertionPointToStart(innerBody);
+    Value inputValue1 = affineApply1->getOperand(0);
+    promotedAffineApply1 = rewriter.create<AffineApplyOp>(affineApply1->getLoc(), m1Map, ValueRange{inputValue1, inputValue0});
   }
 
   // Replace uses of the old operations starting at the root2 loop body
   root2Body->walk([&](Operation *op) {
     for (auto &operand : op->getOpOperands()) {
-      if (res.schd == IS && operand.get() == affineApply0->getResult(0))
+      if (operand.get() == affineApply0->getResult(0))
         operand.set(modifiedAffineApply0->getResult(0));
-      else if (res.schd == IS && operand.get() == affineApply1->getResult(0))
+      else if (operand.get() == affineApply1->getResult(0))
         operand.set(promotedAffineApply1->getResult(0));
       else if (res.schd == IS && operand.get() == tensorExtractSlice1->getResult(0))
         operand.set(promotedTensorExtractSlice1->getResult(0));
@@ -1240,16 +1244,16 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target,
   LogicalResult result0 = swapInductionVars(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
 
-  // For debug only:
-  auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
-  llvm::errs() << "\n=== Loops after tiling & swapInductionVars === \n" << rootLoop << "\n\n";
+  // ======== For debug only: ========
+  // auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  // llvm::errs() << "\n=== Loops after tiling & swapInductionVars === \n" << rootLoop << "\n\n";
 
   // Promote some inner loop Ops depending on the schedule (WS or IS)
   LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, csaConv, res, strides, loopOps);
   if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
 
-  // For debug only:
-  llvm::errs() << "\n=== Loops after tiling & promoteOpsOfTile === \n" << rootLoop << "\n\n";
+  // ======== For debug only: ========
+  // llvm::errs() << "\n=== Loops after tiling & promoteOpsOfTile === \n" << rootLoop << "\n\n";
 
   // // Generate the filter packing
   LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
@@ -1298,20 +1302,20 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
   auto offset = iterationSpace[dim].offset;
   auto size = iterationSpace[dim].size;
 
-  // for debug only:
-  llvm::errs() << "=== Iteration Domain Sizes ===\n";
-  for (unsigned i = 0; i < iterationSpace.size(); ++i) {
-    llvm::errs() << "Dim " << i << ": ";
-    OpFoldResult size = iterationSpace[i].size;
-    if (auto attr = size.dyn_cast<Attribute>()) {
-      attr.print(llvm::errs());
-    } else if (auto val = size.dyn_cast<Value>()) {
-      val.print(llvm::errs());
-    } else {
-      llvm::errs() << "Unknown\n";
-    }
-    llvm::errs() << "\n";
-  }
+  // ======== for debug only: ========
+  // llvm::errs() << "=== Iteration Domain Sizes ===\n";
+  // for (unsigned i = 0; i < iterationSpace.size(); ++i) {
+  //   llvm::errs() << "Dim " << i << ": ";
+  //   OpFoldResult size = iterationSpace[i].size;
+  //   if (auto attr = size.dyn_cast<Attribute>()) {
+  //     attr.print(llvm::errs());
+  //   } else if (auto val = size.dyn_cast<Value>()) {
+  //     val.print(llvm::errs());
+  //   } else {
+  //     llvm::errs() << "Unknown\n";
+  //   }
+  //   llvm::errs() << "\n";
+  // }
 
   // Ensure splitPoint is an index attribute (static)
   auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
@@ -1418,12 +1422,12 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   }
   auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
-  // For debug only:
-  llvm::errs() << "=== Splitted kernels ===\n";
-  llvm::errs() << "First :\n ";
-  firstOp.print(llvm::errs());
-  llvm::errs() << "\nLast :\n ";
-  secondOp.print(llvm::errs());
+  // ======== For debug only: ========
+  // llvm::errs() << "=== Splitted kernels ===\n";
+  // llvm::errs() << "First :\n ";
+  // firstOp.print(llvm::errs());
+  // llvm::errs() << "\nLast :\n ";
+  // secondOp.print(llvm::errs());
 
   // Apply the tiling for each part of the split
   SmallVector<Operation*, 7> firstResults, secondResults;
@@ -1442,7 +1446,7 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   }
   resultLoops.push_back(firstLoopSet);
 
-  // For debug only:
+  // ======== For debug only: ========
   // auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
   // llvm::errs() << "Loops after tiling for first convOp: \n" << root1Loop << "\n\n";
 
@@ -1458,7 +1462,7 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   }
   resultLoops.push_back(secondLoopSet);
 
-  // For debug only:
+  // ======== For debug only: =========
   // auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
   // llvm::errs() << "Loops after tiling for second convOp: \n" << root2Loop << "\n\n";
 

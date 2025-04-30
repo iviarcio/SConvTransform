@@ -413,6 +413,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
   Value inputValue0 = affineApply0->getOperand(0);
   int64_t iw = csaConv.input_cols;
   int64_t ow = csaConv.output_cols;
+  int64_t ss = csaConv.split_size;
   int64_t strideH = strides[0];
   int64_t strideW = strides[1];
 
@@ -434,7 +435,9 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
   AffineExpr d1, s0;
   bindDims(context, d1);
   bindSymbols(context, s0);
-  AffineExpr m1Expr = ((((d1 + s0).floorDiv(ow) - s0.floorDiv(ow)) * strideH) * iw + ((d1 + s0) % ow - s0 % ow) * strideW);
+  AffineExpr m1Expr = ss == 0
+    ? ((((d1 + s0).floorDiv(ow) - s0.floorDiv(ow)) * strideH) * iw + ((d1 + s0) % ow - s0 % ow) * strideW)
+    : ((((d1 + s0 + ss).floorDiv(ow) - (s0 + ss).floorDiv(ow)) * strideH) * iw + ((d1 + s0 + ss) % ow - (s0 + ss) % ow) * strideW);
   AffineMap m1Map = AffineMap::get(1, 1, {m1Expr}, context);
 
   // Clone operations to the outer loop

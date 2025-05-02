@@ -154,7 +154,7 @@ static Value computeFilterIndices(OpBuilder &b, Location loc, Value oIndex,
   // Create the affine map with both indices as inputs.
   AffineMap convMap = AffineMap::get(2, 0, {oExpr * strideExpr + fExpr}, b.getContext());
   
-  // Apply the affine map to the provided indices.
+  // Construct the affineApply with the provided indices.
   return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
 }
 
@@ -171,20 +171,20 @@ static SmallVector<Value, 2> computeLinearInputIndices(
   int64_t strideH = strides[0];
   int64_t strideW = strides[1];
 
-  // Compute NcIndex (iNc) = iK floorDiv (Fh * Fw)
+  // Construct NcIndex (iNc) = iK floorDiv (Fh * Fw)
   AffineExpr d0;
   bindDims(context, d0);
   AffineMap NcMap = AffineMap::get(1, 0, {d0.floorDiv(filterHW)}, context);
   Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {kIndex});
 
-  // Compute ILstart = IOin + IOout + Ss, using IOout as symbol
+  // Construct ILstart = IOin + IOout + Ss, using IOout as symbol
   AffineExpr d1, s0;
   bindDims(context, d1);
   bindSymbols(context, s0);
   AffineMap ILstartMap = AffineMap::get(1, 1, {d1 + s0 + Ss}, context);
   Value ILstart = affine::makeComposedAffineApply(b, loc, ILstartMap, {IOin, IOout});
 
-  // Compute Hwindex (iHw) using ILstart as symbol
+  // Construct Hwindex (iHw) using ILstart as symbol
   AffineExpr k, nwin, s_ilstart;
   bindDims(context, k, nwin);
   bindSymbols(context, s_ilstart);
@@ -228,6 +228,171 @@ static SmallVector<Value, 3> computeMultiPackInputIndices(
   Value TwIndex = affine::makeComposedAffineApply(b, loc, TwMap, {nIndex, tIndex, kIndex, nwinIndex});
 
   return {NcIndex, ThIndex, TwIndex};
+}
+
+// Some Utility functions used in promoteOpsOfTile
+static Value createLinearizedAffineApply(OpBuilder &rewriter, Location loc,
+                                         MLIRContext *context,
+                                         Value ILrange, Value ILstart,
+                                         int64_t strideH, int64_t strideW, int64_t ow, int64_t iw) {
+
+  // Construct: (((ILrange/ow - ILstart/ow) * strideH) * iw + ((ILrange%ow - ILstart%ow) * strideW))
+  AffineExpr s2, s1;
+  bindSymbols(context, s2, s1);
+  AffineExpr expr = (((s2.floorDiv(ow) - s1.floorDiv(ow)) * strideH) * iw +
+                     (s2 % ow - s1 % ow) * strideW);
+  AffineMap map = AffineMap::get(0, 2, {expr}, context);
+  return rewriter.create<AffineApplyOp>(loc, map, ValueRange{ILrange, ILstart});
+}
+
+static std::pair<Value, Value> computeILstartAndRange(OpBuilder &rewriter, Location loc,
+                                                      MLIRContext *context,
+                                                      Value inputValue0, Value inputValue1,
+                                                      int64_t ss) {
+  // Construct ILstart = inputValue0 + ss
+  AffineExpr d0;
+  bindDims(context, d0);
+  AffineMap ILstartMap = AffineMap::get(1, 0, {d0 + ss}, context);
+  Value ILstart = affine::makeComposedAffineApply(rewriter, loc, ILstartMap, {inputValue0});
+
+  // Construct ILrange = inputValue1 + inputValue0 + ss
+  AffineExpr d1, s0;
+  bindDims(context, d1);
+  bindSymbols(context, s0);
+  AffineMap ILrangeMap = AffineMap::get(1, 1, {d1 + s0 + ss}, context);
+  Value ILrange = affine::makeComposedAffineApply(rewriter, loc, ILrangeMap, {inputValue1, inputValue0});
+
+  return {ILstart, ILrange};
+}
+
+static Value promoteSimpleAffineApply(OpBuilder &rewriter, Location loc,
+                                      MLIRContext *context,
+                                      Value d, Value s,
+                                      int64_t strideH, int64_t strideW, int64_t ow, int64_t iw) {
+  // Construct: (((d1 + s0)/ow - s0/ow) * strideH) * iw + ((d1 + s0)%ow - s0%ow) * strideW
+  AffineExpr d1, s0;
+  bindDims(context, d1);
+  bindSymbols(context, s0);
+  AffineExpr expr = (((d1 + s0).floorDiv(ow) - s0.floorDiv(ow)) * strideH) * iw +
+                    ((d1 + s0) % ow - s0 % ow) * strideW;
+  AffineMap map = AffineMap::get(1, 1, {expr}, context);
+  return rewriter.create<AffineApplyOp>(loc, map, ValueRange{d, s});
+}
+
+// After the inner tile operation, promote the two affine.apply and the first extracted
+// slice if chd = IS or the second extracted slice if schd = WS, to the outer loop
+// Also, fix the maps of both AffineApplyOps for the linearized input
+static LogicalResult
+promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv,
+                 CSAStrategy res, SmallVector<int64_t, 2> strides,
+                 SmallVector<Operation *> loopOps) {
+
+  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
+  auto root2Loop = dyn_cast<scf::ForOp>(loopOps[idx - 1]);
+  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
+  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx + 1]);
+  if (!root2Loop || !outerLoop || !innerLoop)
+    return transformOp->emitError("Loops must be scf.for");
+
+  Block *root2Body = root2Loop.getBody();
+  Block *outerBody = outerLoop.getBody();
+  Block *innerBody = innerLoop.getBody();
+
+  Operation *affineApply0 = nullptr;
+  Operation *affineApply1 = nullptr;
+  Operation *tensorExtractSlice1 = nullptr;
+  Operation *tensorExtractSlice2 = nullptr;
+
+  // Get the (only) affine operation at the root2 loop body
+  for (Operation &op : root2Body->getOperations())
+    if (!affineApply0 && isa<AffineApplyOp>(&op))
+      affineApply0 = &op;
+
+  // Get the target operations (affineApply & extractedSlice) in the inner loop body
+  for (Operation &op : innerBody->getOperations()) {
+    if (!affineApply1 && isa<AffineApplyOp>(&op))
+      affineApply1 = &op;
+    else if (!tensorExtractSlice1 && isa<tensor::ExtractSliceOp>(&op))
+      tensorExtractSlice1 = &op;
+    else if (!tensorExtractSlice2 && isa<tensor::ExtractSliceOp>(&op))
+      tensorExtractSlice2 = &op;
+
+    // Stop once all target operations are found
+    if (affineApply1 && tensorExtractSlice1 && tensorExtractSlice2)
+      break;
+  }
+
+  if (!affineApply0 || !affineApply1 || !tensorExtractSlice1 || !tensorExtractSlice2)
+    return transformOp->emitError("Failed to locate necessary operations for promotion");
+
+  // Set insertion point at the start of root2 loop
+  rewriter.setInsertionPointToStart(root2Body);
+
+  // Get context
+  MLIRContext *context = rewriter.getContext();
+
+  Location loc = affineApply1->getLoc();
+  Value inputValue0 = affineApply0->getOperand(0);
+  Value inputValue1;
+
+  int64_t iw = csaConv.input_cols;
+  int64_t ow = csaConv.output_cols;
+  int64_t ss = csaConv.split_size;
+  int64_t strideH = strides[0];
+  int64_t strideW = strides[1];
+
+  // Modify the first Affine op with new (fixed) map
+  AffineExpr d0;
+  bindDims(context, d0);
+  AffineMap m0Map = AffineMap::get(1, 0, {((d0.floorDiv(ow)) * strideH) * iw + ((d0 % ow) * strideW)}, context);
+  Operation *newAffineApply0 = rewriter.create<AffineApplyOp>(affineApply0->getLoc(), m0Map, inputValue0);
+
+  Operation *promotedTensorExtractSlice1 = nullptr;
+  Operation *promotedTensorExtractSlice2 = nullptr;
+  Value newAffineApply1;
+
+  if (res.schd == IS) {
+    rewriter.setInsertionPointToStart(outerBody);
+    inputValue1 = outerLoop.getInductionVar();
+    if (ss == 0) {
+      newAffineApply1 = promoteSimpleAffineApply(rewriter, loc, context, inputValue1, inputValue0, strideH, strideW, ow, iw);
+    } else {
+      auto [ILstart, ILrange] = computeILstartAndRange(rewriter, loc, context, inputValue0, inputValue1, ss);
+      newAffineApply1 = createLinearizedAffineApply(rewriter, loc, context, ILrange, ILstart, strideH, strideW, ow, iw);
+    }
+    promotedTensorExtractSlice1 = rewriter.clone(*tensorExtractSlice1);
+  } else {
+    rewriter.setInsertionPointToStart(innerBody);
+    inputValue1 = innerLoop.getInductionVar();
+    if (ss == 0) {
+      newAffineApply1 = promoteSimpleAffineApply(rewriter, loc, context, inputValue1, inputValue0, strideH, strideW, ow, iw);
+    } else {
+      auto [ILstart, ILrange] = computeILstartAndRange(rewriter, loc, context, inputValue0, inputValue1, ss);
+      newAffineApply1 = createLinearizedAffineApply(rewriter, loc, context, ILrange, ILstart, strideH, strideW, ow, iw);
+    }
+    rewriter.setInsertionPointToStart(outerBody);
+    promotedTensorExtractSlice2 = rewriter.clone(*tensorExtractSlice2);
+  }
+
+  root2Body->walk([&](Operation *op) {
+    for (auto &operand : op->getOpOperands()) {
+      if (operand.get() == affineApply0->getResult(0))
+        operand.set(newAffineApply0->getResult(0));
+      else if (operand.get() == affineApply1->getResult(0))
+        operand.set(newAffineApply1);
+      else if (res.schd == IS && operand.get() == tensorExtractSlice1->getResult(0))
+        operand.set(promotedTensorExtractSlice1->getResult(0));
+      else if (res.schd == WS && operand.get() == tensorExtractSlice2->getResult(0))
+        operand.set(promotedTensorExtractSlice2->getResult(0));
+    }
+  });
+
+  if (affineApply0->use_empty()) rewriter.eraseOp(affineApply0);
+  if (affineApply1->use_empty()) rewriter.eraseOp(affineApply1);
+  if (tensorExtractSlice1->use_empty()) rewriter.eraseOp(tensorExtractSlice1);
+  if (tensorExtractSlice2->use_empty()) rewriter.eraseOp(tensorExtractSlice2);
+
+  return success();
 }
 
 // After the packing operations, the linalOps (uKernel) must be fixed to 
@@ -350,181 +515,6 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
       break;
     }
   }
-
-  return success();
-}
-
-// After the inner tile operation, promote the two affine.apply and the first extracted
-// slice if chd = IS or the second extracted slice if schd = WS, to the outer loop
-// Also, fix the maps of both AffineApplyOp of the linearized input
-static LogicalResult
-promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv,
-                 CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<Operation *> loopOps) {
-
-  // Validate input loops
-  int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
-  auto root2Loop = dyn_cast<scf::ForOp>(loopOps[idx-1]);
-  auto outerLoop = dyn_cast<scf::ForOp>(loopOps[idx]);
-  auto innerLoop = dyn_cast<scf::ForOp>(loopOps[idx+1]);
-  if (!root2Loop || !outerLoop || !innerLoop)
-    return transformOp->emitError("Loops must be scf.for");
-
-  // Get the body of the loops
-  Block *root2Body = root2Loop.getBody();
-  Block *outerBody = outerLoop.getBody();
-  Block *innerBody = innerLoop.getBody();
-
-  Operation *affineApply0 = nullptr;
-  Operation *affineApply1 = nullptr;
-  Operation *tensorExtractSlice1 = nullptr;
-  Operation *tensorExtractSlice2 = nullptr;
-
-  // Get the (only) affine operation at the root2 loop body
-  for (Operation &op : root2Body->getOperations()) {
-    if (!affineApply0 && isa<AffineApplyOp>(&op))
-      affineApply0 = &op;
-    if (affineApply0)
-      break;
-  }
-
-  // Get the target operations (affineApply & extractedSlice) in the inner loop body
-  for (Operation &op : innerBody->getOperations()) {
-    if (!affineApply1 && isa<AffineApplyOp>(&op))
-      affineApply1 = &op;
-    else if (!tensorExtractSlice1 && isa<tensor::ExtractSliceOp>(&op))
-      tensorExtractSlice1 = &op;
-    else if (!tensorExtractSlice2 && isa<tensor::ExtractSliceOp>(&op))
-      tensorExtractSlice2 = &op;
-
-    // Stop once all target operations are found
-    if (affineApply1 && tensorExtractSlice1 && tensorExtractSlice2)
-      break;
-  }
-
-  if (!affineApply0 || !affineApply1 || !tensorExtractSlice1 || !tensorExtractSlice2)
-    return transformOp->emitError("Failed to hosting some Ops");
-
-  // Set insertion point at the start of root2 loop
-  rewriter.setInsertionPointToStart(root2Body);
-
-  // Get context
-  MLIRContext *context = rewriter.getContext();
-
-  // Get some common values used by both map replacements
-  Location loc = affineApply1->getLoc();
-  Value inputValue0 = affineApply0->getOperand(0);
-  Value inputValue1;
-  Value ILstart;
-  Value ILrange;
-  AffineMap m1Map;
-  AffineExpr m1Expr;
-
-  int64_t iw = csaConv.input_cols;
-  int64_t ow = csaConv.output_cols;
-  int64_t ss = csaConv.split_size;
-  int64_t strideH = strides[0];
-  int64_t strideW = strides[1];
-
-  // Modify the first Affine op with new (fixed) map
-  Operation *modifiedAffineApply0 = nullptr;
-  AffineExpr d0;
-  bindDims(context, d0);
-  AffineExpr m0Expr = ((d0.floorDiv(ow)) * strideH) * iw + ((d0 % ow) * strideW);
-  AffineMap m0Map = AffineMap::get(1, 0, {m0Expr}, context);
-  modifiedAffineApply0 = rewriter.create<AffineApplyOp>(affineApply0->getLoc(), m0Map, inputValue0);
-
-  Operation *promotedAffineApply1 = nullptr;
-  Operation *promotedTensorExtractSlice1 = nullptr;
-  Operation *promotedTensorExtractSlice2 = nullptr;
-
-  if (res.schd == IS) {
-    // Set insertion point at the start of outer loop
-    rewriter.setInsertionPointToStart(outerBody);
-    inputValue1 = outerLoop.getInductionVar();
-    if (ss == 0) {
-      AffineExpr d1, s0;
-      bindDims(context, d1);
-      bindSymbols(context, s0);
-      m1Expr = ((((d1 + s0).floorDiv(ow) - s0.floorDiv(ow)) * strideH) * iw + ((d1 + s0) % ow - s0 % ow) * strideW);
-      m1Map = AffineMap::get(1, 1, {m1Expr}, context);
-      promotedAffineApply1 = rewriter.create<AffineApplyOp>(loc, m1Map, ValueRange{inputValue1, inputValue0});
-    } else {
-      // Compute ILstart = inputValue0 + ss
-      AffineExpr iv0;
-      bindDims(context, iv0);
-      AffineMap ILstartMap = AffineMap::get(1, 0, {iv0 + ss}, context);
-      ILstart = affine::makeComposedAffineApply(rewriter, loc, ILstartMap, {inputValue0});
-
-      // Compute ILrange = inputValue1 + inputValue0 + ss, using inputValue0 as symbol
-      AffineExpr iv1, sv0;
-      bindDims(context, iv1);
-      bindSymbols(context, sv0);
-      AffineMap ILrangeMap = AffineMap::get(1, 1, {iv1 + sv0 + ss}, context);
-      ILrange = affine::makeComposedAffineApply(rewriter, loc, ILrangeMap, {inputValue1, inputValue0});
-
-      AffineExpr s2, s1;
-      bindSymbols(context, s2, s1);
-      m1Expr = (((s2.floorDiv(ow) - s1.floorDiv(ow)) * strideH) * iw + (s2 % ow - s1 % ow) * strideW);
-      m1Map = AffineMap::get(0, 2, {m1Expr}, context);
-      promotedAffineApply1 = rewriter.create<AffineApplyOp>(loc, m1Map, ValueRange{ILrange, ILstart});
-    }
-    promotedTensorExtractSlice1 = rewriter.clone(*tensorExtractSlice1);
-
-  } else {
-    // Set insertion point at the start of inner loop
-    rewriter.setInsertionPointToStart(innerBody);
-    inputValue1 = innerLoop.getInductionVar();  // affineApply1->getOperand(0);
-    if (ss == 0) {
-      AffineExpr d1, s0;
-      bindDims(context, d1);
-      bindSymbols(context, s0);
-      m1Expr = ((((d1 + s0).floorDiv(ow) - s0.floorDiv(ow)) * strideH) * iw + ((d1 + s0) % ow - s0 % ow) * strideW);
-      m1Map = AffineMap::get(1, 1, {m1Expr}, context);
-      promotedAffineApply1 = rewriter.create<AffineApplyOp>(loc, m1Map, ValueRange{inputValue1, inputValue0});
-    }
-    else {
-      // Compute ILstart = inputValue0 + ss
-      AffineExpr iv0;
-      bindDims(context, iv0);
-      AffineMap ILstartMap = AffineMap::get(1, 0, {iv0 + ss}, context);
-      ILstart = affine::makeComposedAffineApply(rewriter, loc, ILstartMap, {inputValue0});
-
-      // Compute ILrange = inputValue1 + inputValue0 + ss, using inputValue0 as symbol
-      AffineExpr iv1, sv0;
-      bindDims(context, iv1);
-      bindSymbols(context, sv0);
-      AffineMap ILrangeMap = AffineMap::get(1, 1, {iv1 + sv0 + ss}, context);
-      ILrange = affine::makeComposedAffineApply(rewriter, loc, ILrangeMap, {inputValue1, inputValue0});
-
-      AffineExpr s2, s1;
-      bindSymbols(context, s2, s1);
-      m1Expr = (((s2.floorDiv(ow) - s1.floorDiv(ow)) * strideH) * iw + (s2 % ow - s1 % ow) * strideW);
-      m1Map = AffineMap::get(0, 2, {m1Expr}, context);
-      promotedAffineApply1 = rewriter.create<AffineApplyOp>(loc, m1Map, ValueRange{ILrange, ILstart});
-    }
-    rewriter.setInsertionPointToStart(outerBody);
-    promotedTensorExtractSlice2 = rewriter.clone(*tensorExtractSlice2);
-  }
-
-  // Replace uses of the old operations starting at the root2 loop body
-  root2Body->walk([&](Operation *op) {
-    for (auto &operand : op->getOpOperands()) {
-      if (operand.get() == affineApply0->getResult(0))
-        operand.set(modifiedAffineApply0->getResult(0));
-      else if (operand.get() == affineApply1->getResult(0))
-        operand.set(promotedAffineApply1->getResult(0));
-      else if (res.schd == IS && operand.get() == tensorExtractSlice1->getResult(0))
-        operand.set(promotedTensorExtractSlice1->getResult(0));
-      else if (res.schd == WS && operand.get() == tensorExtractSlice2->getResult(0))
-        operand.set(promotedTensorExtractSlice2->getResult(0));
-    }
-  });
-
-  // Erase the old operations
-  if (affineApply0->use_empty()) rewriter.eraseOp(affineApply0);
-  if (affineApply1->use_empty()) rewriter.eraseOp(affineApply1);
-  if (tensorExtractSlice1->use_empty()) rewriter.eraseOp(tensorExtractSlice1);
-  if (tensorExtractSlice2->use_empty()) rewriter.eraseOp(tensorExtractSlice2);
 
   return success();
 }

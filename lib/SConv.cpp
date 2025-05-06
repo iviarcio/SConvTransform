@@ -203,22 +203,14 @@ static SmallVector<Value, 2> computeLinearInputIndices(
 }
 
 // Compute the linearized multi-pack input indices considering strides and tensor structure.
-static SmallVector<Value, 2> computeMultiPackInputIndices(
-    OpBuilder &b, Location loc, Value tIndex, Value kIndex, Value nwinIndex,
-    Value IOut, int64_t Ss, int64_t Fh, int64_t Fw, int64_t Ow, int64_t Iw, 
-    int64_t Nwin, SmallVector<int64_t, 2> strides) {
+static Value computeMultiPackInputIndices(
+    OpBuilder &b, Location loc, Value tIndex, Value fhIndex, Value fwIndex, Value nwinIndex,
+    Value IOut, int64_t Ss, int64_t Ow, int64_t Iw, int64_t Nwin, SmallVector<int64_t, 2> strides) {
 
   MLIRContext *context = b.getContext();
 
-  int64_t filterHW = Fh * Fw;
   int64_t strideH = strides[0];
   int64_t strideW = strides[1];
-
-  // Construct NcIndex (iNc) = iK floorDiv (Fh * Fw)
-  AffineExpr d0;
-  bindDims(context, d0);
-  AffineMap NcMap = AffineMap::get(1, 0, {d0.floorDiv(filterHW)}, context);
-  Value NcIndex = affine::makeComposedAffineApply(b, loc, NcMap, {kIndex});
 
   Value ILstart;
   if (Ss == 0) 
@@ -232,22 +224,20 @@ static SmallVector<Value, 2> computeMultiPackInputIndices(
   }
 
   // Construct Hwindex (iHw) using ILstart as symbol
-  AffineExpr dt, dk, dw, s_ilstart;
-  bindDims(context, dt, dk, dw);
+  AffineExpr dt, dFh, dFw, dw, s_ilstart;
+  bindDims(context, dt, dFh, dFw, dw);
   bindSymbols(context, s_ilstart);
   AffineExpr iHwExpr = 
-      ((((s_ilstart + dt * Nwin + dw).floorDiv(Ow) - s_ilstart.floorDiv(Ow)) * strideH) +
-       ((dk % filterHW).floorDiv(Fw))) * Iw +
-      (((s_ilstart + dt * Nwin + dw) % Ow - s_ilstart % Ow) * strideW) +
-      (dk % Fw);
+      ((((s_ilstart + dt * Nwin + dw).floorDiv(Ow) - s_ilstart.floorDiv(Ow)) * strideH) + dFh) * Iw +
+      (((s_ilstart + dt * Nwin + dw) % Ow - s_ilstart % Ow) * strideW) + dFw;
 
-  AffineMap iHwMap = AffineMap::get(3, 1, {iHwExpr}, context);
+  AffineMap iHwMap = AffineMap::get(4, 1, {iHwExpr}, context);
   Value HwIndex = b.create<affine::AffineApplyOp>(
       loc, 
       iHwMap,
-      ValueRange{tIndex, kIndex, nwinIndex, ILstart});
+      ValueRange{tIndex, fhIndex, fwIndex, nwinIndex, ILstart});
 
-  return {NcIndex, HwIndex};
+  return HwIndex;
 }
 
 // Some Utility functions used in promoteOpsOfTile
@@ -875,13 +865,13 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
   int64_t ow = csaConv.output_cols;
   int64_t Nwin = csa.mK_.nwindows;
 
-  SmallVector<int64_t, 4> inputPackingShape = {Ni, Ti, Nc * Fh * Fw, Nwin};
+  SmallVector<int64_t, 6> inputPackingShape = {Ni, Ti, Nc, Fh, Fw, Nwin};
   Value inputPacking = rewriter.create<tensor::EmptyOp>(loc, inputPackingShape, inputType.getElementType());
 
   auto nloops = inputPackingShape.size();
   auto parallel = utils::IteratorType::parallel;
-  SmallVector<utils::IteratorType, 4> packingIterators(nloops, parallel);
-  SmallVector<AffineMap, 4> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
+  SmallVector<utils::IteratorType, 6> packingIterators(nloops, parallel);
+  SmallVector<AffineMap, 6> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
 
   Value IO_out = nestLoop.getInductionVar();
   int64_t ss = csaConv.split_size;
@@ -895,15 +885,15 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
     Value iN = nestedBuilder.create<linalg::IndexOp>(loc, 0);
     Value iT = nestedBuilder.create<linalg::IndexOp>(loc, 1);
-    Value iK = nestedBuilder.create<linalg::IndexOp>(loc, 2);
-    Value iNwin = nestedBuilder.create<linalg::IndexOp>(loc, 3);
+    Value iC = nestedBuilder.create<linalg::IndexOp>(loc, 2);
+    Value iFh = nestedBuilder.create<linalg::IndexOp>(loc, 3);
+    Value iFw = nestedBuilder.create<linalg::IndexOp>(loc, 4);
+    Value iNwin = nestedBuilder.create<linalg::IndexOp>(loc, 5);
 
-    SmallVector<Value, 2> inputIndices = computeMultiPackInputIndices(
-        nestedBuilder, nestedLoc, iT, iK, iNwin, IO_out, ss, Fh, Fw, ow, iw, Nwin, strides);
-    Value iNc = inputIndices[0];
-    Value iHw = inputIndices[1];
+    Value iHw = computeMultiPackInputIndices(nestedBuilder, nestedLoc,
+        iT, iFh, iFw, iNwin, IO_out, ss, ow, iw, Nwin, strides);
 
-    SmallVector<Value> extractionIndices{iN, iNc, iHw};
+    SmallVector<Value> extractionIndices{iN, iC, iHw};
     Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, inputSlice->getResult(0), extractionIndices);
     nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
   });
@@ -915,21 +905,29 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
       innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(Nwin), context), innerLoop.getInductionVar());
  
   // Define new offsets, sizes, and strides for new extractedSlice
-  SmallVector<OpFoldResult, 4> newSliceOffsets = {
-      rewriter.getIndexAttr(0), affineIndex, rewriter.getIndexAttr(0), rewriter.getIndexAttr(0) };
-  SmallVector<OpFoldResult, 4> newSliceSizes = {
-      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(inputPackingShape[2]), rewriter.getIndexAttr(inputPackingShape[3]) };
-  SmallVector<OpFoldResult, 4> newSliceStrides = {
-      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1) };
+  SmallVector<OpFoldResult, 6> newSliceOffsets = {
+      rewriter.getIndexAttr(0), affineIndex, rewriter.getIndexAttr(0),
+      rewriter.getIndexAttr(0), rewriter.getIndexAttr(0), rewriter.getIndexAttr(0) };
+
+  SmallVector<OpFoldResult, 6> newSliceSizes = {
+      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1),
+      rewriter.getIndexAttr(inputPackingShape[2]), rewriter.getIndexAttr(inputPackingShape[3]),
+      rewriter.getIndexAttr(inputPackingShape[4]), rewriter.getIndexAttr(inputPackingShape[5])};
+
+  SmallVector<OpFoldResult, 6> newSliceStrides = {
+      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1),
+      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1) };
 
   Value updatedExtractedSlice = rewriter.create<tensor::ExtractSliceOp>(
     innerLoop.getLoc(), newPackingTensor.getResult(0), newSliceOffsets, newSliceSizes, newSliceStrides);
 
-  // Apply tensor.collapse_shape on the first two dimensions of new extractedSlice
-  SmallVector<ReassociationIndices> collapseDims = {{0, 1}, {2}, {3}};
+  // Apply tensor.collapse_shape on the dimensions of new extractedSlice
+  SmallVector<ReassociationIndices> collapseDims = {{0, 1}, {2, 3, 4}, {5}};
   Value collapsedSlice = rewriter.create<tensor::CollapseShapeOp>(
       innerLoop.getLoc(),
-      RankedTensorType::get({inputPackingShape[0], inputPackingShape[2], inputPackingShape[3]}, inputType.getElementType()),
+      RankedTensorType::get({inputPackingShape[0],
+        inputPackingShape[2]* inputPackingShape[3] * inputPackingShape[4],
+        inputPackingShape[5]}, inputType.getElementType()),
       updatedExtractedSlice,
       collapseDims);
 

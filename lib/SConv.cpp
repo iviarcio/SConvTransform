@@ -1081,13 +1081,13 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   int64_t Nc = filterShape[1];
   int64_t Fh = filterShape[2];
   int64_t Fw = filterShape[3];
-  SmallVector<int64_t, 3> filterPackingShape = {Tf, Nc * Fh * Fw, Nf};
+  SmallVector<int64_t, 5> filterPackingShape = {Tf, Nc, Fh, Fw, Nf};
   Value filterPacking = rewriter.create<tensor::EmptyOp>(loc, filterPackingShape, filterType.getElementType());
 
   auto nloops = filterPackingShape.size();
   auto parallel = utils::IteratorType::parallel;
-  SmallVector<utils::IteratorType, 3> packingIterators(nloops, parallel);
-  SmallVector<AffineMap, 3> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
+  SmallVector<utils::IteratorType, 5> packingIterators(nloops, parallel);
+  SmallVector<AffineMap, 5> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
 
   auto newPackingTensor = rewriter.create<linalg::GenericOp>(
     loc, filterPacking.getType(),
@@ -1096,18 +1096,23 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
     packingIndexingMaps,
     packingIterators,
     [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-    Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0);
-    Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1);
-    Value index2 = nestedBuilder.create<linalg::IndexOp>(loc, 2);
+    Value index0 = nestedBuilder.create<linalg::IndexOp>(loc, 0); // iTf
+    Value index1 = nestedBuilder.create<linalg::IndexOp>(loc, 1); // iNc
+    Value index2 = nestedBuilder.create<linalg::IndexOp>(loc, 2); // iFh
+    Value index3 = nestedBuilder.create<linalg::IndexOp>(loc, 3); // iFw
+    Value index4 = nestedBuilder.create<linalg::IndexOp>(loc, 4); // iNf
 
-    SmallVector<Value> unpackedIndices = unrollIndex(
-      nestedBuilder, nestedLoc, index1, ArrayRef<int64_t>{Nc, Fh, Fw});
-    Value NcIndex = unpackedIndices[0];
-    Value FhIndex = unpackedIndices[1];
-    Value FwIndex = unpackedIndices[2];
+    AffineExpr d0, d1;
+    bindDims(context, d0, d1);
+    
+    // Create the affine map with both indices as inputs.
+    AffineMap tfMap = AffineMap::get(2, 0, {d0 * Nf + d1}, context);
+    
+    // Construct the affineApply with the provided indices.
+    Value TfIndex = rewriter.create<affine::AffineApplyOp>(loc, tfMap, ValueRange{index0, index4});
 
-    Value kIndex = computeFilterIndices(nestedBuilder, nestedLoc, index0, index2, Nf);
-    SmallVector<Value> extractionIndices{kIndex, NcIndex, FhIndex, FwIndex};
+    // Create the extraction indices for the original filter tensor
+    SmallVector<Value> extractionIndices{TfIndex, index1, index2, index3};
 
     Value filterVal = nestedBuilder.create<tensor::ExtractOp>(loc, filterSlice, extractionIndices);
     nestedBuilder.create<linalg::YieldOp>(nestedLoc, filterVal);
@@ -1120,23 +1125,37 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
       innerLoop.getLoc(), AffineMap::get(1, 0, getAffineDimExpr(0, context).floorDiv(Nf), context), innerLoop.getInductionVar());
 
   // Define new offsets, sizes, and strides for new extractedSlice
-  SmallVector<OpFoldResult, 3> newSliceOffsets = {
-      affineIndex, rewriter.getIndexAttr(0), rewriter.getIndexAttr(0) };
-  SmallVector<OpFoldResult, 3> newSliceSizes = {
-      rewriter.getIndexAttr(1), rewriter.getIndexAttr(filterPackingShape[1]), rewriter.getIndexAttr(filterPackingShape[2]) };
-  SmallVector<OpFoldResult, 3> newSliceStrides = {
-      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1) };
+  SmallVector<OpFoldResult, 5> newSliceOffsets = {
+      affineIndex, rewriter.getIndexAttr(0), rewriter.getIndexAttr(0), rewriter.getIndexAttr(0), rewriter.getIndexAttr(0) };
+
+  SmallVector<OpFoldResult, 5> newSliceSizes = {
+      rewriter.getIndexAttr(1),
+      rewriter.getIndexAttr(filterPackingShape[1]), rewriter.getIndexAttr(filterPackingShape[2]),
+      rewriter.getIndexAttr(filterPackingShape[3]), rewriter.getIndexAttr(filterPackingShape[4])};
+
+  SmallVector<OpFoldResult, 5> newSliceStrides = {
+      rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1) };
 
   Value updatedExtractedSlice = rewriter.create<tensor::ExtractSliceOp>(
     innerLoop.getLoc(), newPackingTensor.getResult(0), newSliceOffsets, newSliceSizes, newSliceStrides);
 
-  // Apply tensor.collapse_shape on the first two dimensions of new extractedSlice
-  SmallVector<ReassociationIndices> collapseDims = {{0, 1}, {2}};
+  // Apply tensor.collapse_shape on the dimensions of new extractedSlice
+  SmallVector<ReassociationIndices> collapseDims = {{0}, {1, 2, 3}, {4}};
   Value collapsedSlice = rewriter.create<tensor::CollapseShapeOp>(
       innerLoop.getLoc(),
-      RankedTensorType::get({filterPackingShape[1], filterPackingShape[2]}, filterType.getElementType()),
+      RankedTensorType::get({1, filterPackingShape[1] * filterPackingShape[2] * filterPackingShape[3], filterPackingShape[4]},
+                            filterType.getElementType()),
       updatedExtractedSlice,
       collapseDims);
+
+  // Apply tensor.collapse_shape again to the new collapsed slice
+  SmallVector<ReassociationIndices> newCollapseDims = {{0, 1}, {2}};
+  Value newCollapsedSlice = rewriter.create<tensor::CollapseShapeOp>(
+      innerLoop.getLoc(),
+      RankedTensorType::get({filterPackingShape[1] * filterPackingShape[2] * filterPackingShape[3], filterPackingShape[4]},
+                            filterType.getElementType()),
+      collapsedSlice,
+      newCollapseDims);
 
   // Get the old uKernel & old filterPacking
   linalg::GenericOp linalgOp;
@@ -1154,7 +1173,7 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   auto linalgInputs = linalgOp.getInputs(); 
   SmallVector<Value, 2> newInputs;
   newInputs.push_back(linalgInputs[0]); // Same inputPacking
-  newInputs.push_back(collapsedSlice);  // Replace old filterPacking
+  newInputs.push_back(newCollapsedSlice);  // Replace old filterPacking
 
   // Get the indexingMaps of linalgOp
   SmallVector<AffineMap, 3> indexingMaps;

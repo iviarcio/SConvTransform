@@ -144,20 +144,6 @@ static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
   return *multiIndex;
 }
 
-// Compute the multi-packing filter indices considering strides and tensor structure.
-static Value computeFilterIndices(OpBuilder &b, Location loc, Value oIndex,
-                               Value fIndex, int64_t stride) {
-  AffineExpr oExpr, fExpr, strideExpr;
-  bindDims(b.getContext(), oExpr, fExpr);
-  strideExpr = b.getAffineConstantExpr(stride);
-  
-  // Create the affine map with both indices as inputs.
-  AffineMap convMap = AffineMap::get(2, 0, {oExpr * strideExpr + fExpr}, b.getContext());
-  
-  // Construct the affineApply with the provided indices.
-  return affine::makeComposedAffineApply(b, loc, convMap, {oIndex, fIndex});
-}
-
 // Compute the linearized input indices considering strides and tensor structure.
 static SmallVector<Value, 2> computeLinearInputIndices(
     OpBuilder &b, Location loc, Value kIndex, Value nwinIndex, Value IOin,
@@ -1030,7 +1016,6 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
   }
 
   return success();
-
 }
 
 // Pack multiple filter tiles adding a new dimension to the tensor k2 which
@@ -1137,25 +1122,16 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
       rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1), rewriter.getIndexAttr(1) };
 
   Value updatedExtractedSlice = rewriter.create<tensor::ExtractSliceOp>(
-    innerLoop.getLoc(), newPackingTensor.getResult(0), newSliceOffsets, newSliceSizes, newSliceStrides);
+      innerLoop.getLoc(), newPackingTensor.getResult(0), newSliceOffsets, newSliceSizes, newSliceStrides);
 
   // Apply tensor.collapse_shape on the dimensions of new extractedSlice
-  SmallVector<ReassociationIndices> collapseDims = {{0}, {1, 2, 3}, {4}};
+  SmallVector<ReassociationIndices> collapseDims = {{0, 1, 2, 3}, {4}};
   Value collapsedSlice = rewriter.create<tensor::CollapseShapeOp>(
       innerLoop.getLoc(),
-      RankedTensorType::get({1, filterPackingShape[1] * filterPackingShape[2] * filterPackingShape[3], filterPackingShape[4]},
+      RankedTensorType::get({1 * filterPackingShape[1] * filterPackingShape[2] * filterPackingShape[3], filterPackingShape[4]},
                             filterType.getElementType()),
       updatedExtractedSlice,
       collapseDims);
-
-  // Apply tensor.collapse_shape again to the new collapsed slice
-  SmallVector<ReassociationIndices> newCollapseDims = {{0, 1}, {2}};
-  Value newCollapsedSlice = rewriter.create<tensor::CollapseShapeOp>(
-      innerLoop.getLoc(),
-      RankedTensorType::get({filterPackingShape[1] * filterPackingShape[2] * filterPackingShape[3], filterPackingShape[4]},
-                            filterType.getElementType()),
-      collapsedSlice,
-      newCollapseDims);
 
   // Get the old uKernel & old filterPacking
   linalg::GenericOp linalgOp;
@@ -1172,8 +1148,8 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
 
   auto linalgInputs = linalgOp.getInputs(); 
   SmallVector<Value, 2> newInputs;
-  newInputs.push_back(linalgInputs[0]); // Same inputPacking
-  newInputs.push_back(newCollapsedSlice);  // Replace old filterPacking
+  newInputs.push_back(linalgInputs[0]); // The same inputPacking
+  newInputs.push_back(collapsedSlice);  // Replace the old filterPacking
 
   // Get the indexingMaps of linalgOp
   SmallVector<AffineMap, 3> indexingMaps;
@@ -1238,7 +1214,6 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   }
 
   return success();
-
 }
 
 // Apply a tiling transformation to a modified payload ops and store both the

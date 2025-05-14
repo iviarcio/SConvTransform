@@ -1335,12 +1335,12 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
   if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
 
   // Generate the filter Multi-Packing
-  // LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
-  // if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
+  LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
+  if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
 
   // Generate the input Multi-Packing
-  // LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csaConv, csa, res, strides, dilations, tiledOps, loopOps);
-  // if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
+  LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csaConv, csa, res, strides, dilations, tiledOps, loopOps);
+  if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
 
   // Store the results (Operation*) in the output variable (as Value)
   outResults.push_back(tiledOps.front());  // The head is the linalg.generic (uKernel)

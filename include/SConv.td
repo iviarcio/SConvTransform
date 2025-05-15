@@ -67,4 +67,18 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
 
 }
 
+def LowerToBlasOp : Op<Transform_Dialect, "lower.to_blas",
+    [DeclareOpInterfaceMethods<TransformOpInterface>,
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Lower micro-kernels to BLAS kernel routines.";
+  let description = [{}];
+  let arguments = (ins
+    StrAttr:$name,
+    TransformHandleTypeInterface:$target
+  );
+  let results = (outs TransformHandleTypeInterface:$output);
+  let assemblyFormat = "$name `,` $target attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 #endif // SCONV

@@ -13,6 +13,7 @@
 #include "SConv.h"
 
 #include "CSA.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -98,6 +99,7 @@ void SConv::init() {
   declareGeneratedDialect<index::IndexDialect>();
   declareGeneratedDialect<scf::SCFDialect>();
   declareGeneratedDialect<tensor::TensorDialect>();
+  declareGeneratedDialect<LLVM::LLVMDialect>();
 
   // Finally, we register the additional transform operations with the dialect.
   // List all operations generated from ODS. This call will perform additional

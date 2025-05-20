@@ -89,10 +89,9 @@ public:
 
     // 3) Calculate the number of W and IN tiles following the mK
     // restrictions
-    in_tiles_per_tch = (uint32_t)ceil((conv_.output_rows * conv_.output_cols) /
-                                      (double)mK_.nwindows);
-    w_tiles_per_tch =
-        (uint32_t)ceil(conv_.num_filters / (double)mK_.num_filters);
+    in_tiles_per_tch = (uint32_t)((conv_.output_rows * conv_.output_cols) /
+                                  (double)mK_.nwindows);
+    w_tiles_per_tch = (uint32_t)(conv_.num_filters / (double)mK_.num_filters);
 
     // 4) Compute K2 and K3
     computeK2();

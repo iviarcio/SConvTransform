@@ -1370,19 +1370,19 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
   auto size = iterationSpace[dim].size;
 
   // ======== for debug only: ========
-  // llvm::errs() << "=== Iteration Domain Sizes ===\n";
-  // for (unsigned i = 0; i < iterationSpace.size(); ++i) {
-  //   llvm::errs() << "Dim " << i << ": ";
-  //   OpFoldResult size = iterationSpace[i].size;
-  //   if (auto attr = size.dyn_cast<Attribute>()) {
-  //     attr.print(llvm::errs());
-  //   } else if (auto val = size.dyn_cast<Value>()) {
-  //     val.print(llvm::errs());
-  //   } else {
-  //     llvm::errs() << "Unknown\n";
-  //   }
-  //   llvm::errs() << "\n";
-  // }
+  llvm::errs() << "=== Iteration Domain Sizes ===\n";
+  for (unsigned i = 0; i < iterationSpace.size(); ++i) {
+    llvm::errs() << "Dim " << i << ": ";
+    OpFoldResult size = iterationSpace[i].size;
+    if (auto attr = size.dyn_cast<Attribute>()) {
+      attr.print(llvm::errs());
+    } else if (auto val = size.dyn_cast<Value>()) {
+      val.print(llvm::errs());
+    } else {
+      llvm::errs() << "Unknown\n";
+    }
+    llvm::errs() << "\n";
+  }
 
   // Ensure splitPoint is an index attribute (static)
   auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
@@ -1442,6 +1442,86 @@ performSplit(RewriterBase &rewriter, TilingInterface op,
   return linalg::splitOp(rewriter, op, dimension, splitPoint);
 }
 
+/// This function will be called when the convolution has edge case in uKernel
+/// It takes the convolution (`genericOp`), performs the split, and then applies tiling.
+static LogicalResult
+treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operation* target, ConvInfo csaConv,
+    CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
+    SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs) {
+
+  auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
+  if (!tilingInterfaceOp)
+    return transformOp->emitError("only TilingInterface ops are supported");
+
+  MLIRContext *context = rewriter.getContext();
+  Location loc = target->getLoc();
+
+  // Define the dimension & split point to split the convolution
+  // For now, supported split in one dimension only
+  CSAStrategy split_res = res;
+
+  int64_t splitDim = 2;
+  int64_t extraSize = (csaConv.output_rows * csaConv.output_cols) % csa.mK_.nwindows;
+  int64_t splitSize = (csaConv.output_rows * csaConv.output_cols) - extraSize;
+
+  if (res.schd == WS)
+    split_res.k2 = extraSize;
+  else
+    split_res.k3 = extraSize;
+
+  OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
+  if (failed(validateSplitInputs(rewriter, transformOp, tilingInterfaceOp, splitDim, splitPoint))) {
+    return transformOp->emitError("Invalid dimension or splitPoint to call linalg::splitOp"); 
+  }
+  auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
+
+  // ======== For debug only: ========
+  llvm::errs() << "=== Splitted kernels ===\n";
+  llvm::errs() << "First :\n ";
+  firstOp.print(llvm::errs());
+  llvm::errs() << "\nLast :\n ";
+  secondOp.print(llvm::errs());
+
+  // Apply the tiling for each part of the split
+  SmallVector<Operation*, 7> firstResults, secondResults;
+  
+  rewriter.setInsertionPoint(target);
+
+  // In the prologue split, csaConv.split_size equals 0
+  csaConv.split_size = 0;
+  if (failed(applyTileTo(rewriter, transformOp, firstOp, csaConv, csa, res, strides, dilations, firstResults))) {
+    return transformOp->emitError("Failed to apply tiling on first convOp after split.");
+  }
+  resultConvs.push_back(firstResults[0]);
+  SmallVector<Operation*, 6> firstLoopSet;
+  for (int i = 1; i <= 6; ++i) {
+    firstLoopSet.push_back(firstResults[i]);
+  }
+  resultLoops.push_back(firstLoopSet);
+
+  // ======== For debug only: ========
+  auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
+  llvm::errs() << "Loops after tiling for first convOp: \n" << root1Loop << "\n\n";
+
+  // In the epilogue split, csaConv.split_size equals splitSize
+  csaConv.split_size = splitSize;
+  if (failed(applyTileTo(rewriter, transformOp, secondOp, csaConv, csa, split_res, strides, dilations, secondResults))) {
+    return transformOp->emitError("Failed to apply tiling on second convOp after split.");
+  }
+  resultConvs.push_back(secondResults[0]);
+  SmallVector<Operation*, 6> secondLoopSet;
+  for (int i = 1; i < secondResults.size(); ++i) {
+    secondLoopSet.push_back(secondResults[i]);
+  }
+  resultLoops.push_back(secondLoopSet);
+
+  // ======== For debug only: =========
+  auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
+  llvm::errs() << "Loops after tiling for second convOp: \n" << root2Loop << "\n\n";
+
+  return success();
+}
+
 /// This function will be called when the convolution needs to be Splitted.
 /// It takes the original convolution (`genericOp`), performs the split, and then applies tiling.
 static LogicalResult
@@ -1489,11 +1569,11 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
   // ======== For debug only: ========
-  // llvm::errs() << "=== Splitted kernels ===\n";
-  // llvm::errs() << "First :\n ";
-  // firstOp.print(llvm::errs());
-  // llvm::errs() << "\nLast :\n ";
-  // secondOp.print(llvm::errs());
+  llvm::errs() << "=== Splitted kernels ===\n";
+  llvm::errs() << "First :\n ";
+  firstOp.print(llvm::errs());
+  llvm::errs() << "\nLast :\n ";
+  secondOp.print(llvm::errs());
 
   // Apply the tiling for each part of the split
   SmallVector<Operation*, 7> firstResults, secondResults;
@@ -1513,8 +1593,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   resultLoops.push_back(firstLoopSet);
 
   // ======== For debug only: ========
-  // auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
-  // llvm::errs() << "Loops after tiling for first convOp: \n" << root1Loop << "\n\n";
+  auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
+  llvm::errs() << "Loops after tiling for first convOp: \n" << root1Loop << "\n\n";
 
   // In the epilogue split, csaConv.split_size equals splitSize
   csaConv.split_size = splitSize;
@@ -1529,8 +1609,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   resultLoops.push_back(secondLoopSet);
 
   // ======== For debug only: =========
-  // auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
-  // llvm::errs() << "Loops after tiling for second convOp: \n" << root2Loop << "\n\n";
+  auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
+  llvm::errs() << "Loops after tiling for second convOp: \n" << root2Loop << "\n\n";
 
   return success();
 }
@@ -1730,18 +1810,24 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
         return emitSilenceableError() << "Failed to apply split & tiling to the convolution operation";
     }
     else {
-      SmallVector<Operation*, 7> localResults;
-      // If no split then csaConv.split_size equals 0
-      csaConv.split_size = 0;
-      if (failed(applyTileTo(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, dilations, localResults)))
-        return emitSilenceableError() << "Failed to apply tiling to one of the convolution operations";
-      // The first result is the transformed linalg.generic (uKernel)
-      tempResultConvs.push_back(localResults[0]);
-      // Following, the generated loops
-      SmallVector<Operation*, 6> loopSet;
-      for (int i = 1; i <= 6; ++i)
-        loopSet.push_back(localResults[i]);
-      tempResultLoops.push_back(loopSet);
+      csaConv.split_size = 0; // If no split then csaConv.split_size equals 0
+      bool hasEdgeCase = (oh * ow) % mK.nwindows != 0;
+      if (hasEdgeCase) {
+        if (failed(treatEdgeTileConvolution(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, dilations, tempResultLoops, tempResultConvs)))
+          return emitSilenceableError() << "Failed to treat ukernel edge cases to on of the convolution operation";
+      }
+      else {
+        SmallVector<Operation*, 7> localResults;
+        if (failed(applyTileTo(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, dilations, localResults)))
+          return emitSilenceableError() << "Failed to apply tiling to one of the convolution operations";
+        // The first result is the transformed linalg.generic (uKernel)
+        tempResultConvs.push_back(localResults[0]);
+        // Following, the generated loops
+        SmallVector<Operation*, 6> loopSet;
+        for (int i = 1; i <= 6; ++i)
+          loopSet.push_back(localResults[i]);
+        tempResultLoops.push_back(loopSet);
+      }
     }
   }
 

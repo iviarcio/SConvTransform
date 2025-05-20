@@ -1460,14 +1460,23 @@ treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operati
   // For now, supported split in one dimension only
   CSAStrategy split_res = res;
 
+  int64_t extraSize;
+  int64_t splitSize;
   int64_t splitDim = 2;
-  int64_t extraSize = (csaConv.output_rows * csaConv.output_cols) % csa.mK_.nwindows;
-  int64_t splitSize = (csaConv.output_rows * csaConv.output_cols) - extraSize;
+
+  if (csaConv.split_size != 0) {
+    extraSize = csaConv.split_size % csa.mK_.nwindows;
+    splitSize = csaConv.split_size - extraSize;
+  }
+  else {
+    extraSize = (csaConv.output_rows * csaConv.output_cols) % csa.mK_.nwindows;
+    splitSize = (csaConv.output_rows * csaConv.output_cols) - extraSize;
+  }
 
   if (res.schd == WS)
-    split_res.k2 = extraSize;
+    split_res.k2 = csa.mK_.nwindows;   // extraSize;
   else
-    split_res.k3 = extraSize;
+    split_res.k3 = csa.mK_.nwindows;   // extraSize;
 
   OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
   if (failed(validateSplitInputs(rewriter, transformOp, tilingInterfaceOp, splitDim, splitPoint))) {
@@ -1490,7 +1499,7 @@ treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operati
   // In the prologue split, csaConv.split_size equals 0
   csaConv.split_size = 0;
   if (failed(applyTileTo(rewriter, transformOp, firstOp, csaConv, csa, res, strides, dilations, firstResults))) {
-    return transformOp->emitError("Failed to apply tiling on first convOp after split.");
+    return transformOp->emitError("Failed to apply tiling on first convOp in the edge case.");
   }
   resultConvs.push_back(firstResults[0]);
   SmallVector<Operation*, 6> firstLoopSet;
@@ -1501,12 +1510,12 @@ treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operati
 
   // ======== For debug only: ========
   auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
-  llvm::errs() << "Loops after tiling for first convOp: \n" << root1Loop << "\n\n";
+  llvm::errs() << "\nLoops after tiling for first convOp in the edge case: \n" << root1Loop << "\n\n";
 
   // In the epilogue split, csaConv.split_size equals splitSize
   csaConv.split_size = splitSize;
   if (failed(applyTileTo(rewriter, transformOp, secondOp, csaConv, csa, split_res, strides, dilations, secondResults))) {
-    return transformOp->emitError("Failed to apply tiling on second convOp after split.");
+    return transformOp->emitError("Failed to apply tiling on second convOp in the edge case.");
   }
   resultConvs.push_back(secondResults[0]);
   SmallVector<Operation*, 6> secondLoopSet;
@@ -1517,7 +1526,7 @@ treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operati
 
   // ======== For debug only: =========
   auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
-  llvm::errs() << "Loops after tiling for second convOp: \n" << root2Loop << "\n\n";
+  llvm::errs() << "\nLoops after tiling for second convOp in the edge case: \n" << root2Loop << "\n\n";
 
   return success();
 }
@@ -1575,28 +1584,36 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   llvm::errs() << "\nLast :\n ";
   secondOp.print(llvm::errs());
 
-  // Apply the tiling for each part of the split
-  SmallVector<Operation*, 7> firstResults, secondResults;
-  
-  rewriter.setInsertionPoint(target);
-
-  // In the prologue split, csaConv.split_size equals 0
-  csaConv.split_size = 0;
-  if (failed(applyTileTo(rewriter, transformOp, firstOp, csaConv, csa, res, strides, dilations, firstResults))) {
-    return transformOp->emitError("Failed to apply tiling on first convOp after split.");
+  bool hasEdgeCase = splitSize % csa.mK_.nwindows != 0;
+  if (hasEdgeCase) {
+    csaConv.split_size = splitSize;
+    if (failed(treatEdgeTileConvolution(rewriter, transformOp, firstOp, csaConv, csa, res, strides, dilations, resultLoops, resultConvs)))
+      return transformOp->emitError("Failed to treat ukernel edge cases to on of the convolution operation");
   }
-  resultConvs.push_back(firstResults[0]);
-  SmallVector<Operation*, 6> firstLoopSet;
-  for (int i = 1; i <= 6; ++i) {
-    firstLoopSet.push_back(firstResults[i]);
+  else {
+    // Apply the tiling for the first part of the split
+    SmallVector<Operation*, 7> firstResults;
+    rewriter.setInsertionPoint(target);
+    // In the prologue split, csaConv.split_size equals 0
+    csaConv.split_size = 0;
+    if (failed(applyTileTo(rewriter, transformOp, firstOp, csaConv, csa, res, strides, dilations, firstResults))) {
+      return transformOp->emitError("Failed to apply tiling on first convOp after split.");
+    }
+    resultConvs.push_back(firstResults[0]);
+    SmallVector<Operation*, 6> firstLoopSet;
+    for (int i = 1; i <= 6; ++i) {
+      firstLoopSet.push_back(firstResults[i]);
+    }
+    resultLoops.push_back(firstLoopSet);
+
+    // ======== For debug only: ========
+    auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
+    llvm::errs() << "\nLoops after tiling for first convOp: \n" << root1Loop << "\n\n";
   }
-  resultLoops.push_back(firstLoopSet);
 
-  // ======== For debug only: ========
-  auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
-  llvm::errs() << "Loops after tiling for first convOp: \n" << root1Loop << "\n\n";
-
-  // In the epilogue split, csaConv.split_size equals splitSize
+  // Now, apply the tiling for the last part of the split
+  SmallVector<Operation*, 7> secondResults;
+  // In this split, csaConv.split_size equals splitSize
   csaConv.split_size = splitSize;
   if (failed(applyTileTo(rewriter, transformOp, secondOp, csaConv, csa, split_res, strides, dilations, secondResults))) {
     return transformOp->emitError("Failed to apply tiling on second convOp after split.");
@@ -1610,7 +1627,7 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
 
   // ======== For debug only: =========
   auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
-  llvm::errs() << "Loops after tiling for second convOp: \n" << root2Loop << "\n\n";
+  llvm::errs() << "\nLoops after tiling for last convOp: \n" << root2Loop << "\n\n";
 
   return success();
 }

@@ -1839,7 +1839,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     // d0 = batch; d1 = filter; d2 = output height; d3 = output width; d4 = channels; d5 = filter height; d6 = filter width
     AffineExpr d0, d1, d3, d4, d5, d6;
     bindDims(context, d0, d1, d3, d4, d5, d6);
-    auto lhsMap = AffineMap::get(6, 0, {d0, d4, (d3.floorDiv(oh) * hstride + d5) * ih + d3 % oh * wstride + d6}, context);
+    auto lhsMap = AffineMap::get(6, 0, {d0, d4, (d3.floorDiv(oh) * hstride + d5 * hdilation) * ih + d3 % oh * wstride + d6 * wdilation}, context);
     auto rhsMap = AffineMap::get(6, 0, {d1, d4, d5, d6}, context);
     auto resultMap = AffineMap::get(6, 0, {d0, d1, d3}, context);
 

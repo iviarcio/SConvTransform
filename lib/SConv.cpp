@@ -1319,9 +1319,6 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
   LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, csaConv, res, strides, loopOps);
   if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
 
-  // ======== For debug only: ========
-  // llvm::errs() << "\n=== Loops after tiling & promoteOpsOfTile === \n" << rootLoop << "\n\n";
-
   // // Generate the filter packing
   LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
@@ -1370,19 +1367,19 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
   auto size = iterationSpace[dim].size;
 
   // ======== for debug only: ========
-  // llvm::errs() << "=== Iteration Domain Sizes ===\n";
-  // for (unsigned i = 0; i < iterationSpace.size(); ++i) {
-  //   llvm::errs() << "Dim " << i << ": ";
-  //   OpFoldResult size = iterationSpace[i].size;
-  //   if (auto attr = size.dyn_cast<Attribute>()) {
-  //     attr.print(llvm::errs());
-  //   } else if (auto val = size.dyn_cast<Value>()) {
-  //     val.print(llvm::errs());
-  //   } else {
-  //     llvm::errs() << "Unknown\n";
-  //   }
-  //   llvm::errs() << "\n";
-  // }
+  llvm::errs() << "=== Iteration Domain Sizes ===\n";
+  for (unsigned i = 0; i < iterationSpace.size(); ++i) {
+    llvm::errs() << "Dim " << i << ": ";
+    OpFoldResult size = iterationSpace[i].size;
+    if (auto attr = size.dyn_cast<Attribute>()) {
+      attr.print(llvm::errs());
+    } else if (auto val = size.dyn_cast<Value>()) {
+      val.print(llvm::errs());
+    } else {
+      llvm::errs() << "Unknown\n";
+    }
+    llvm::errs() << "\n";
+  }
 
   // Ensure splitPoint is an index attribute (static)
   auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
@@ -1489,11 +1486,11 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
   // ======== For debug only: ========
-  // llvm::errs() << "=== Splitted kernels ===\n";
-  // llvm::errs() << "First :\n ";
-  // firstOp.print(llvm::errs());
-  // llvm::errs() << "\nLast :\n ";
-  // secondOp.print(llvm::errs());
+  llvm::errs() << "=== Splitted kernels ===\n";
+  llvm::errs() << "First :\n ";
+  firstOp.print(llvm::errs());
+  llvm::errs() << "\nLast :\n ";
+  secondOp.print(llvm::errs());
 
   // Apply the tiling for the first part of the split
   SmallVector<Operation*, 7> firstResults;
@@ -1511,8 +1508,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   resultLoops.push_back(firstLoopSet);
 
   // ======== For debug only: ========
-  // auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
-  // llvm::errs() << "\nLoops after tiling for first convOp: \n" << root1Loop << "\n\n";
+  auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
+  llvm::errs() << "\nLoops after tiling for first convOp: \n" << root1Loop << "\n\n";
 
   // Now, apply the tiling for the last part of the split
   SmallVector<Operation*, 7> secondResults;
@@ -1529,8 +1526,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   resultLoops.push_back(secondLoopSet);
 
   // ======== For debug only: =========
-  // auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
-  // llvm::errs() << "\nLoops after tiling for last convOp: \n" << root2Loop << "\n\n";
+  auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
+  llvm::errs() << "\nLoops after tiling for last convOp: \n" << root2Loop << "\n\n";
 
   return success();
 }
@@ -1564,10 +1561,12 @@ adjustSecondOpIndexingMap(RewriterBase &rewriter, Operation *secondOp, ConvInfo 
   int64_t ow = csaConv.output_rows;
   int64_t strideH = strides[0];
   int64_t strideW = strides[1];
+  int64_t dilationH = dilations[0];
+  int64_t dilationW = dilations[1];
 
   AffineExpr d2_plus_offset = dims[2] + offset;
-  AffineExpr term1 = (((d2_plus_offset.floorDiv(oh)) - (offset.floorDiv(oh))) * strideH + dims[4]) * ih;
-  AffineExpr term2 = ((d2_plus_offset % ow - (offset % ow)) * strideW) + dims[5];
+  AffineExpr term1 = (((d2_plus_offset.floorDiv(oh)) - (offset.floorDiv(oh))) * strideH + dims[4] * dilationH) * ih;
+  AffineExpr term2 = ((d2_plus_offset % ow - (offset % ow)) * strideW) + dims[5] * dilationW;
   AffineExpr newd2Expr = term1 + term2;
 
   // Build the new indexing map: (d0, d3, <newd2Expr>)
@@ -1588,94 +1587,141 @@ adjustSecondOpIndexingMap(RewriterBase &rewriter, Operation *secondOp, ConvInfo 
   return genericOp;
 }
 
-/// This function will be called when the convolution has edge case in uKernel
-/// It takes the convolution (`genericOp`), performs the split, and then applies tiling.
-static LogicalResult
-treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operation* target, ConvInfo csaConv,
-    CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
-    SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs) {
+/// Auxiliary function to perform split
+static LogicalResult splitConvolution(
+    RewriterBase &rewriter, Operation *transformOp, Operation *target, int64_t splitDim,
+    int64_t splitSize, Operation *&firstOp, Operation *&secondOp) {
 
   auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
   if (!tilingInterfaceOp)
     return transformOp->emitError("only TilingInterface ops are supported");
 
-  MLIRContext *context = rewriter.getContext();
-  Location loc = target->getLoc();
-
-  // Define the dimension & split point to divide the convolution
-  CSAStrategy split_res = res;
-
-  int64_t extraSize = (csaConv.output_rows * csaConv.output_cols) % csa.mK_.nwindows;
-  int64_t splitSize = (csaConv.output_rows * csaConv.output_cols) - extraSize;
-  int64_t splitDim = 2; // Handle ukernel edge case of input only
-
-  if (res.schd == WS)
-    split_res.k2 = extraSize;
-  else
-    split_res.k3 = extraSize;
-
   OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
   if (failed(validateSplitInputs(rewriter, transformOp, tilingInterfaceOp, splitDim, splitPoint))) {
-    return transformOp->emitError("Invalid dimension or splitPoint to call linalg::splitOp"); 
+    return transformOp->emitError("Invalid dimension or splitPoint to call linalg::splitOp");
   }
-  auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
+  std::tie(firstOp, secondOp) = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
   // ======== For debug only: ========
-  // llvm::errs() << "=== Splitted kernels ===\n";
-  // llvm::errs() << "First :\n ";
-  // firstOp.print(llvm::errs());
-  // llvm::errs() << "\nLast :\n ";
-  // secondOp.print(llvm::errs());
+  llvm::errs() << "=== Splitted kernels ===\n";
+  llvm::errs() << "First :\n";
+  firstOp->print(llvm::errs());
+  llvm::errs() << "\nLast :\n";
+  secondOp->print(llvm::errs());
+  llvm::errs() << "\nSplit Size used :" << splitSize << "\n";
 
-  // Handle the edge case of CSA Analysis
+  return success();
+}
+
+/// Auxiliary function to handle CSA edge case and/or apply tiling
+static LogicalResult handleTilingOrSplit(RewriterBase &rewriter, Operation *transformOp, Operation* op,
+    ConvInfo csaConv, CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
+    SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs) {
+
   bool requiresSplit = (res.extra_k2 != 0) || (res.extra_k3 != 0) || (res.extra_tile_c != 0);
   if (requiresSplit) {
-    csaConv.split_size = extraSize;
-    if (failed(splitAndTileConvolution(rewriter, transformOp, firstOp, csaConv, csa, res, strides, dilations, resultLoops, resultConvs)))
+    if (failed(splitAndTileConvolution(rewriter, transformOp, op, csaConv, csa, res, strides, dilations, resultLoops, resultConvs)))
       return transformOp->emitError("Failed to apply split & tiling to the convolution operation");
-  }
-  else {
-    // Apply the tiling for the first part of the split
+  } else {
     SmallVector<Operation*, 7> firstResults;
-    
-    rewriter.setInsertionPoint(target);
+    rewriter.setInsertionPoint(op);
 
     // In the prologue split, csaConv.split_size equals 0
     csaConv.split_size = 0;
-    if (failed(applyTileTo(rewriter, transformOp, firstOp, csaConv, csa, res, strides, dilations, firstResults))) {
-      return transformOp->emitError("Failed to apply tiling on first convOp in the edge case.");
-    }
+
+    if (failed(applyTileTo(rewriter, transformOp, op, csaConv, csa, res, strides, dilations, firstResults)))
+      return transformOp->emitError("Failed to apply tiling.");
+
     resultConvs.push_back(firstResults[0]);
-    SmallVector<Operation*, 6> firstLoopSet;
+    SmallVector<Operation*, 6> loopSet;
     for (int i = 1; i <= 6; ++i) {
-      firstLoopSet.push_back(firstResults[i]);
+      loopSet.push_back(firstResults[i]);
     }
-    resultLoops.push_back(firstLoopSet);
-
-    // ======== For debug only: ========
-    // auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
-    // llvm::errs() << "\nLoops after tiling for first convOp in the edge case: \n" << root1Loop << "\n\n";
+    resultLoops.push_back(loopSet);
   }
+  return success();
+}
 
-  auto maybeGeneric = adjustSecondOpIndexingMap(rewriter, secondOp, csaConv, strides, dilations, splitSize);
-  if (failed(maybeGeneric))
-    return transformOp->emitError("Failed to adjust indexing_map for secondOp");
+/// This function will be called when the convolution has edge cases in the Kernel
+/// It takes the convolution (`genericOp`), performs the necessary splits, and then applies tiling.
+static LogicalResult
+treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operation* target, ConvInfo csaConv,
+    CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
+    SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs) {
 
-  // // TODO: In the epilogue split, apply the pad before tilling
-  // csaConv.split_size = splitSize;
-  // if (failed(applyTileTo(rewriter, transformOp, secondOp, csaConv, csa, split_res, strides, dilations, secondResults))) {
-  //   return transformOp->emitError("Failed to apply tiling on second convOp in the edge case.");
-  // }
-  // resultConvs.push_back(secondResults[0]);
-  // SmallVector<Operation*, 6> secondLoopSet;
-  // for (int i = 1; i < secondResults.size(); ++i) {
-  //   secondLoopSet.push_back(secondResults[i]);
-  // }
-  // resultLoops.push_back(secondLoopSet);
-  //
-  // // ======== For debug only: =========
-  // auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
-  // llvm::errs() << "\nLoops after tiling for second convOp in the edge case: \n" << root2Loop << "\n\n";
+  MLIRContext *context = rewriter.getContext();
+  Location loc = target->getLoc();
+
+  // Check edge cases
+  bool edgeInput = ((csaConv.output_rows * csaConv.output_cols) % csa.mK_.nwindows) != 0;
+  bool edgeFilter = (csaConv.num_filters % csa.mK_.num_filters) != 0;
+
+  Operation *currentOp = target;
+
+  if (edgeInput) {
+    // Handle edge case of input: split on dim=2
+    int64_t extraSizeInput = (csaConv.output_rows * csaConv.output_cols) % csa.mK_.nwindows;
+    int64_t splitSizeInput = (csaConv.output_rows * csaConv.output_cols) - extraSizeInput;
+    int64_t splitDimInput = 2;
+
+    CSAStrategy split_res = res;
+    if (res.schd == WS)
+      split_res.k2 = extraSizeInput;
+    else
+      split_res.k3 = extraSizeInput;
+
+    Operation *firstOpInput = nullptr, *secondOpInput = nullptr;
+    if (failed(splitConvolution(rewriter, transformOp, currentOp, splitDimInput, splitSizeInput, firstOpInput, secondOpInput)))
+      return transformOp->emitError("Failed to split on input dimension");
+
+    if (edgeFilter) {
+      // Handle edge case of filter: split on dim=1, applied on firstOpInput
+      int64_t extraSizeFilter = csaConv.num_filters % csa.mK_.num_filters;
+      int64_t splitSizeFilter = csaConv.num_filters - extraSizeFilter;
+      int64_t splitDimFilter = 1;
+
+      Operation *firstOpFilter = nullptr, *secondOpFilter = nullptr;
+      if (failed(splitConvolution(rewriter, transformOp, firstOpInput, splitDimFilter, splitSizeFilter, firstOpFilter, secondOpFilter)))
+        return transformOp->emitError("Failed to split on filter dimension");
+
+      // Propagate the split_size & apply tiling for firstOpFilter
+      csaConv.split_size = extraSizeFilter;
+      if (failed(handleTilingOrSplit(rewriter, transformOp, firstOpFilter, csaConv, csa, res, strides, dilations, resultLoops, resultConvs)))
+        return transformOp->emitError("Failed on handleTilingOrSplit for firstOpFilter.");
+
+      auto maybeGenericFilter = adjustSecondOpIndexingMap(rewriter, secondOpFilter, csaConv, strides, dilations, splitSizeFilter);
+      if (failed(maybeGenericFilter))
+        return transformOp->emitError("Failed to adjust indexing_map for secondOpFilter.");
+    } else {
+      // Propagate the split_size & apply tiling for firstOpInput
+      csaConv.split_size = extraSizeInput;
+      if (failed(handleTilingOrSplit(rewriter, transformOp, firstOpInput, csaConv, csa, res, strides, dilations, resultLoops, resultConvs)))
+        return transformOp->emitError("Failed on handleTilingOrSplit for firstOpInput.");
+    }
+
+    // Adjust indexing map in the small kernel adding offset 
+    auto maybeGenericInput = adjustSecondOpIndexingMap(rewriter, secondOpInput, csaConv, strides, dilations, splitSizeInput);
+    if (failed(maybeGenericInput))
+      return transformOp->emitError("Failed to adjust indexing_map for secondOpInput.");
+
+  } else if (edgeFilter) {
+    // Only edge case of filter: split on dim=1
+    int64_t extraSizeFilter = csaConv.num_filters % csa.mK_.num_filters;
+    int64_t splitSizeFilter = csaConv.num_filters - extraSizeFilter;
+    int64_t splitDimFilter = 1;
+
+    Operation *firstOpFilter = nullptr, *secondOpFilter = nullptr;
+    if (failed(splitConvolution(rewriter, transformOp, currentOp, splitDimFilter, splitSizeFilter, firstOpFilter, secondOpFilter)))
+      return transformOp->emitError("Failed to split on filter dimension");
+
+    if (failed(handleTilingOrSplit(rewriter, transformOp, firstOpFilter, csaConv, csa, res, strides, dilations, resultLoops, resultConvs)))
+      return transformOp->emitError("Failed on handleTilingOrSplit for firstOpFilter.");
+
+    // Adjust indexing map in the small kernel adding offset 
+    auto maybeGenericFilter = adjustSecondOpIndexingMap(rewriter, secondOpFilter, csaConv, strides, dilations, splitSizeFilter);
+    if (failed(maybeGenericFilter))
+      return transformOp->emitError("Failed to adjust indexing_map for secondOpFilter.");
+  }
 
   return success();
 }
@@ -1802,6 +1848,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     int64_t ic = inputShape[1];
     int64_t ih = inputShape[2];
     int64_t iw = inputShape[3];
+    int64_t fn = filterShape[0];
     int64_t fh = filterShape[2];
     int64_t fw = filterShape[3];
     int64_t oc = outputShape[1];
@@ -1864,12 +1911,12 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
 
     // Call the CSA Analysis
-    ConvInfo csaConv = {ic, iw, oh, ow, fh, fw, oc, 0, 4};
+    ConvInfo csaConv = {ic, iw, oh, ow, fh, fw, fn, 0, 4};
     CSA csa = createCSAPass(arch, csaConv, mK);
     CSAStrategy res = csa();
     
-    // check if has edge case of input. Do not handle edge case of filter, yet.
-    bool hasEdgeCase = (oh * ow) % mK.nwindows != 0;
+    // check if has edge case of input or filter in the kernel.
+    bool hasEdgeCase = ((oh * ow) % mK.nwindows != 0) || (fn % mK.num_filters != 0);
     if (hasEdgeCase) {
       if (failed(treatEdgeTileConvolution(rewriter, getOperation(), genericOp, csaConv, csa, res, strides, dilations, tempResultLoops, tempResultConvs)))
         return emitSilenceableError() << "Failed to treat ukernel edge cases to on of the convolution operation";

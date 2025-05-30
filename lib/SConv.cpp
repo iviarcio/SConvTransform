@@ -1689,7 +1689,7 @@ treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operati
       if (failed(handleTilingOrSplit(rewriter, transformOp, firstOpFilter, csaConv, csa, res, strides, dilations, resultLoops, resultConvs)))
         return transformOp->emitError("Failed on handleTilingOrSplit for firstOpFilter.");
 
-      auto maybeGenericFilter = adjustSecondOpIndexingMap(rewriter, secondOpFilter, csaConv, strides, dilations, splitSizeFilter);
+      auto maybeGenericFilter = adjustSecondOpIndexingMap(rewriter, secondOpFilter, csaConv, strides, dilations, 0);
       if (failed(maybeGenericFilter))
         return transformOp->emitError("Failed to adjust indexing_map for secondOpFilter.");
     } else {
@@ -1718,7 +1718,7 @@ treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operati
       return transformOp->emitError("Failed on handleTilingOrSplit for firstOpFilter.");
 
     // Adjust indexing map in the small kernel adding offset 
-    auto maybeGenericFilter = adjustSecondOpIndexingMap(rewriter, secondOpFilter, csaConv, strides, dilations, splitSizeFilter);
+    auto maybeGenericFilter = adjustSecondOpIndexingMap(rewriter, secondOpFilter, csaConv, strides, dilations, 0);
     if (failed(maybeGenericFilter))
       return transformOp->emitError("Failed to adjust indexing_map for secondOpFilter.");
   }

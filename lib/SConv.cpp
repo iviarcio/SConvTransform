@@ -1367,19 +1367,19 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
   auto size = iterationSpace[dim].size;
 
   // ======== for debug only: ========
-  llvm::errs() << "=== Iteration Domain Sizes ===\n";
-  for (unsigned i = 0; i < iterationSpace.size(); ++i) {
-    llvm::errs() << "Dim " << i << ": ";
-    OpFoldResult size = iterationSpace[i].size;
-    if (auto attr = size.dyn_cast<Attribute>()) {
-      attr.print(llvm::errs());
-    } else if (auto val = size.dyn_cast<Value>()) {
-      val.print(llvm::errs());
-    } else {
-      llvm::errs() << "Unknown\n";
-    }
-    llvm::errs() << "\n";
-  }
+  // llvm::errs() << "=== Iteration Domain Sizes ===\n";
+  // for (unsigned i = 0; i < iterationSpace.size(); ++i) {
+  //   llvm::errs() << "Dim " << i << ": ";
+  //   OpFoldResult size = iterationSpace[i].size;
+  //   if (auto attr = size.dyn_cast<Attribute>()) {
+  //     attr.print(llvm::errs());
+  //   } else if (auto val = size.dyn_cast<Value>()) {
+  //     val.print(llvm::errs());
+  //   } else {
+  //     llvm::errs() << "Unknown\n";
+  //   }
+  //   llvm::errs() << "\n";
+  // }
 
   // Ensure splitPoint is an index attribute (static)
   auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
@@ -1486,11 +1486,11 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
   // ======== For debug only: ========
-  llvm::errs() << "=== Splitted kernels ===\n";
-  llvm::errs() << "First :\n ";
-  firstOp.print(llvm::errs());
-  llvm::errs() << "\nLast :\n ";
-  secondOp.print(llvm::errs());
+  // llvm::errs() << "=== Splitted kernels ===\n";
+  // llvm::errs() << "First :\n ";
+  // firstOp.print(llvm::errs());
+  // llvm::errs() << "\nLast :\n ";
+  // secondOp.print(llvm::errs());
 
   // Apply the tiling for the first part of the split
   SmallVector<Operation*, 7> firstResults;
@@ -1508,8 +1508,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   resultLoops.push_back(firstLoopSet);
 
   // ======== For debug only: ========
-  auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
-  llvm::errs() << "\nLoops after tiling for first convOp: \n" << root1Loop << "\n\n";
+  // auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
+  // llvm::errs() << "\nLoops after tiling for first convOp: \n" << root1Loop << "\n\n";
 
   // Now, apply the tiling for the last part of the split
   SmallVector<Operation*, 7> secondResults;
@@ -1526,8 +1526,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   resultLoops.push_back(secondLoopSet);
 
   // ======== For debug only: =========
-  auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
-  llvm::errs() << "\nLoops after tiling for last convOp: \n" << root2Loop << "\n\n";
+  // auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
+  // llvm::errs() << "\nLoops after tiling for last convOp: \n" << root2Loop << "\n\n";
 
   return success();
 }
@@ -1603,12 +1603,12 @@ static LogicalResult splitConvolution(
   std::tie(firstOp, secondOp) = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
   // ======== For debug only: ========
-  llvm::errs() << "=== Splitted kernels ===\n";
-  llvm::errs() << "First :\n";
-  firstOp->print(llvm::errs());
-  llvm::errs() << "\nLast :\n";
-  secondOp->print(llvm::errs());
-  llvm::errs() << "\nSplit Size used :" << splitSize << "\n";
+  // llvm::errs() << "=== Splitted kernels ===\n";
+  // llvm::errs() << "First :\n";
+  // firstOp->print(llvm::errs());
+  // llvm::errs() << "\nLast :\n";
+  // secondOp->print(llvm::errs());
+  // llvm::errs() << "\nSplit Size used :" << splitSize << "\n";
 
   return success();
 }

@@ -68,6 +68,8 @@ public:
   void computeTileC() {
     tile_c = (this->*heuristic)(conv_.input_channels, &Strategies::tileSizeL1,
                                 arch_.l1_size);
+    if (tile_c == 0)
+      tile_c = 1;
   }
 
   uint64_t compute() {
@@ -174,12 +176,22 @@ public:
   void computeK2() override {
     k2 = (this->*heuristic)(w_tiles_per_tch, &Strategies::tileSizeL2,
                             arch_.l2_size);
-    extra_k2 = w_tiles_per_tch % k2;
+    if (k2 != 0) {
+      extra_k2 = w_tiles_per_tch % k2;
+    } else {
+      k2 = 1;
+      extra_k2 = 0;
+    }
   }
   void computeK3() override {
     k3 = (this->*heuristic)(in_tiles_per_tch, &Strategies::tileSizeL3,
                             arch_.l3_size);
-    extra_k3 = in_tiles_per_tch % k3;
+    if (k3 != 0) {
+      extra_k3 = in_tiles_per_tch % k3;
+    } else {
+      k3 = 1;
+      extra_k3 = 0;
+    }
   }
   uint64_t cost_model() override {
     // EQ1 -- first access to any tile comes from memory
@@ -280,12 +292,23 @@ public:
   void computeK2() override {
     k2 = (this->*heuristic)(in_tiles_per_tch, &Strategies::tileSizeL2,
                             arch_.l2_size);
-    extra_k2 = in_tiles_per_tch % k2;
+    if (k2 != 0) {
+      extra_k2 = in_tiles_per_tch % k2;
+    } else {
+      k2 = 1;
+      extra_k2 = 0;
+    }
+
   }
   void computeK3() override {
     k3 = (this->*heuristic)(w_tiles_per_tch, &Strategies::tileSizeL3,
                             arch_.l3_size);
-    extra_k3 = w_tiles_per_tch % k3;
+    if (k3 != 0) {
+      extra_k3 = w_tiles_per_tch % k3;
+    } else {
+      k3 = 1;
+      extra_k3 = 0;
+    }
   }
   uint64_t cost_model() override {
     // EQ1

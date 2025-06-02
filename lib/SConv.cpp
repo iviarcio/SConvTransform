@@ -692,6 +692,9 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, filterVal);
     });
 
+  packingTensor->setAttrs({{"packing", rewriter.getStringAttr("filter")},
+                           {"multipacking", rewriter.getBoolAttr(false)}});
+
   // Apply tensor.collapse_shape on the dimensions of new packingTensor
   SmallVector<ReassociationIndices> collapseDims = {{0, 1, 2}, {3}};
   Value collapsedTensor = rewriter.create<tensor::CollapseShapeOp>(
@@ -812,6 +815,9 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
       // Yield the extracted value into the packed tensor
       nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
     });
+
+  packingTensor->setAttrs({{"packing", rewriter.getStringAttr("input")},
+                           {"multipacking", rewriter.getBoolAttr(false)}});
 
   // Apply tensor.collapse_shape on the dimensions of new packingTensor
   SmallVector<ReassociationIndices> collapseDims = {{0}, {1, 2, 3}, {4}};
@@ -987,6 +993,9 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
     Value inputVal = nestedBuilder.create<tensor::ExtractOp>(loc, inputSlice->getResult(0), extractionIndices);
     nestedBuilder.create<linalg::YieldOp>(nestedLoc, inputVal);
   });
+
+  newPackingTensor->setAttrs({{"packing", rewriter.getStringAttr("input")},
+                              {"multipacking", rewriter.getBoolAttr(true)}});
 
   // Create the affine.apply at beginning of innerLoop body
   // to indexing the new inputSlice
@@ -1210,6 +1219,9 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
     Value filterVal = nestedBuilder.create<tensor::ExtractOp>(loc, filterSlice, extractionIndices);
     nestedBuilder.create<linalg::YieldOp>(nestedLoc, filterVal);
   });
+
+  newPackingTensor->setAttrs({{"packing", rewriter.getStringAttr("filter")},
+                              {"multipacking", rewriter.getBoolAttr(true)}});
 
   // Create the affine.apply at beginning of innerLoop body to indexing the new filterSlice
   rewriter.setInsertionPointToStart(innerLoop.getBody());
@@ -1459,10 +1471,16 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
     DBGS() << "=== Loops after all packings  === \n" << rootLoop << "\n";
   });
 
+  // Add attributes to the microkernel
+  auto ukernel = tiledOps.front();
+  auto schedule = (res.schd == Scheduling::IS) ? "IS" : "WS";
+  ukernel->setAttrs({{"microkernel", rewriter.getUnitAttr()},
+                     {"schedule", rewriter.getStringAttr(schedule)}});
+
   // Store the results (Operation*) in the output variable (as Value)
-  outResults.push_back(tiledOps.front());  // The head is the linalg.generic (uKernel)
+  outResults.push_back(ukernel);
   for (auto &loop : loopOps)
-    outResults.push_back(loop);  // The tail contain the loops
+    outResults.push_back(loop);
 
   return success();
 }

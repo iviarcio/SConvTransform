@@ -1319,25 +1319,37 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
   LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, csaConv, res, strides, loopOps);
   if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
 
+  // llvm::errs() << "\n=== Loops after promoteOpsOfTile === \n" << rootLoop << "\n\n";
+
   // // Generate the filter packing
   LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
+
+  // llvm::errs() << "\n=== Loops after applyFilterPacking === \n" << rootLoop << "\n\n";
 
   // Generate the input packing
   LogicalResult result3 = applyInputPacking(rewriter, transformOp, csaConv, csa, res, strides, dilations, tiledOps, loopOps);
   if (failed(result3)) return transformOp->emitError("failed to apply the input packing");
 
+  // llvm::errs() << "\n=== Loops after applyInputPacking === \n" << rootLoop << "\n\n";
+
   // Fix the uKernel after packing input & filter
   LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
+
+  // llvm::errs() << "\n=== Loops after adjustLinalgOps === \n" << rootLoop << "\n\n";
 
   // Generate the filter Multi-Packing
   LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
 
+  // llvm::errs() << "\n=== Loops after filterMultipackingOpt === \n" << rootLoop << "\n\n";
+
   // Generate the input Multi-Packing
   LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csaConv, csa, res, strides, dilations, tiledOps, loopOps);
   if (failed(result6)) return transformOp->emitError("failed to apply input Multi-Packing optimization");
+
+  // llvm::errs() << "\n=== Loops after inputMultipackingOpt === \n" << rootLoop << "\n\n";
 
   // Store the results (Operation*) in the output variable (as Value)
   outResults.push_back(tiledOps.front());  // The head is the linalg.generic (uKernel)
@@ -1520,8 +1532,11 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
 
   // Now, apply the tiling for the last part of the split
   SmallVector<Operation*, 7> secondResults;
-  // In this split, csaConv.split_size equals splitSize
-  csaConv.split_size = splitSize;
+
+  // In this split, csaConv.split_size equals splitSize unless edge of channels
+  if (res.extra_tile_c == 0) {
+    csaConv.split_size = splitSize;
+  }
   if (failed(applyTileTo(rewriter, transformOp, secondOp, csaConv, csa, split_res, strides, dilations, secondResults))) {
     return transformOp->emitError("Failed to apply tiling on second convOp after split.");
   }
@@ -1618,8 +1633,10 @@ static LogicalResult splitConvolution(
 
   // ======== For debug only: ========
   // llvm::errs() << "=== Splitted kernels ===\n";
-  // llvm::errs() << "First :\n";
-  // firstOp->print(llvm::errs());
+  // if (firstOp != nullptr) {
+  //   llvm::errs() << "First :\n";
+  //   firstOp->print(llvm::errs());
+  // }
   // llvm::errs() << "\nLast :\n";
   // secondOp->print(llvm::errs());
   // llvm::errs() << "\nSplit Size used :" << splitSize << "\n";

@@ -1504,13 +1504,27 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   else if (res.extra_k2 != 0) {
     splitDim = res.schd == WS ? 2 : 1;
     extraSize = res.schd == WS ? csa.mK_.nwindows * res.extra_k2 : csa.mK_.num_filters * res.extra_k2;
-    splitSize = csaConv.output_rows * csaConv.output_cols - extraSize - csaConv.split_size;
+    if (res.schd == WS) {
+      splitDim = 2;
+      extraSize = csa.mK_.nwindows * res.extra_k2;
+      splitSize = csaConv.output_rows * csaConv.output_cols - extraSize - csaConv.split_size;
+    } else {
+      splitDim = 1;
+      extraSize = csa.mK_.num_filters * res.extra_k2;
+      splitSize = csaConv.num_filters - extraSize - csaConv.split_size;
+    }
     split_res.k2 = res.extra_k2;
   }
   else if (res.extra_k3 != 0) {
-    splitDim = res.schd == IS ? 2 : 1;
-    extraSize = res.schd == IS ? csa.mK_.nwindows * res.extra_k3 : csa.mK_.num_filters * res.extra_k3;
-    splitSize = csaConv.output_rows * csaConv.output_cols - extraSize - csaConv.split_size;
+    if (res.schd == IS) {
+      splitDim = 2;
+      extraSize = csa.mK_.nwindows * res.extra_k3;
+      splitSize = csaConv.output_rows * csaConv.output_cols - extraSize - csaConv.split_size;
+    } else {
+      splitDim = 1;
+      extraSize = csa.mK_.num_filters * res.extra_k3;
+      splitSize = csaConv.num_filters - extraSize - csaConv.split_size;
+    }
     split_res.k3 = res.extra_k3;
   }
 
@@ -1601,17 +1615,16 @@ adjustSecondOpIndexingMap(RewriterBase &rewriter, Operation *secondOp, ConvInfo 
   }
 
   // Construct new AffineExpr for output index
-  int64_t ih = csaConv.input_cols;
-  int64_t oh = csaConv.output_cols;
-  int64_t ow = csaConv.output_rows;
+  int64_t icols = csaConv.input_cols;
+  int64_t ocols = csaConv.output_cols;
   int64_t strideH = strides[0];
   int64_t strideW = strides[1];
   int64_t dilationH = dilations[0];
   int64_t dilationW = dilations[1];
 
   AffineExpr d2_plus_offset = dims[2] + offset;
-  AffineExpr term1 = (((d2_plus_offset.floorDiv(oh)) - (offset.floorDiv(oh))) * strideH + dims[4] * dilationH) * ih;
-  AffineExpr term2 = ((d2_plus_offset % ow - (offset % ow)) * strideW) + dims[5] * dilationW;
+  AffineExpr term1 = (((d2_plus_offset.floorDiv(ocols)) - (offset.floorDiv(ocols))) * strideH + dims[4] * dilationH) * icols;
+  AffineExpr term2 = ((d2_plus_offset % ocols - (offset % ocols)) * strideW) + dims[5] * dilationW;
   AffineExpr newd2Expr = term1 + term2;
 
   // Build the new indexing map: (d0, d3, <newd2Expr>)

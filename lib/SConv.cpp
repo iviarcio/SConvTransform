@@ -338,9 +338,12 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
 
   int64_t iw = csaConv.input_cols;
   int64_t ow = csaConv.output_cols;
+  int64_t fh = csaConv.kernel_rows;
+  int64_t fw = csaConv.kernel_cols;
   int64_t ss = csaConv.split_size;
   int64_t strideH = strides[0];
   int64_t strideW = strides[1];
+
 
   if (!pointwise) inputValue0 = affineApply0->getOperand(0);
 
@@ -349,7 +352,6 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
     AffineExpr d0;
     bindDims(context, d0);
     AffineMap m0Map = AffineMap::get(1, 0, {((d0.floorDiv(ow)) * strideH) * iw + ((d0 % ow) * strideW)}, context);
-    // Operation *newAffineApply0 = rewriter.create<AffineApplyOp>(affineApply0->getLoc(), m0Map, inputValue0);
     newAffineApply0 = rewriter.create<AffineApplyOp>(affineApply0->getLoc(), m0Map, inputValue0);
   }
 
@@ -365,7 +367,41 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
         newAffineApply1 = createLinearizedAffineApply(rewriter, loc, context, ILrange, ILstart, strideH, strideW, ow, iw);
       }
     }
-    promotedTensorExtractSlice1 = rewriter.clone(*tensorExtractSlice1);
+
+    // check if conv is rectangle & kernel_rows equals 1
+    // In this case, insert the newAffineApply1 & modify tensorExtractSlice1
+    if (pointwise && fh != fw && fh == 1) {
+      Location loc = tensorExtractSlice1->getLoc();
+      inputValue1 = outerLoop.getInductionVar();
+      AffineExpr d0;
+      bindDims(context, d0);
+      AffineMap m1Map = AffineMap::get(1, 0, {((d0.floorDiv(ow)) * strideH) * fw + ((d0 % ow) * strideW)}, context);
+      newAffineApply1 = rewriter.create<AffineApplyOp>(loc, m1Map, inputValue1);
+
+      auto sliceOp = cast<tensor::ExtractSliceOp>(tensorExtractSlice1);
+      SmallVector<OpFoldResult> offsets(sliceOp.getMixedOffsets());
+      SmallVector<OpFoldResult> sizes(sliceOp.getMixedSizes());
+      SmallVector<OpFoldResult> stridesVec(sliceOp.getMixedStrides());
+
+      // Replace the induction var to affine.apply
+      for (size_t i = 0; i < offsets.size(); ++i) {
+        if (auto val = offsets[i].dyn_cast<Value>()) {
+          if (val == inputValue1) {
+            offsets[i] = newAffineApply1;
+            break;
+          }
+        }
+      }
+      auto newSlice = rewriter.create<tensor::ExtractSliceOp>(
+          loc, sliceOp.getSource(), offsets, sizes, stridesVec);
+      sliceOp.getResult().replaceAllUsesWith(newSlice.getResult());
+      rewriter.eraseOp(sliceOp);
+      promotedTensorExtractSlice1 = newSlice.getOperation();
+
+    } else {
+      promotedTensorExtractSlice1 = rewriter.clone(*tensorExtractSlice1);
+    }
+
   } else {
     if (!pointwise) {
       rewriter.setInsertionPointToStart(innerBody);
@@ -1762,7 +1798,7 @@ treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operati
         return transformOp->emitError("Failed to adjust indexing_map for secondOpFilter.");
     } else if (firstOpInput != nullptr) {
       // Propagate the split_size & apply tiling for firstOpInput
-      csaConv.split_size = extraSizeInput;
+      csaConv.split_size = 0;  // extraSizeInput;
       if (failed(handleTilingOrSplit(rewriter, transformOp, firstOpInput, csaConv, csa, res, strides, dilations, resultLoops, resultConvs)))
         return transformOp->emitError("Failed on handleTilingOrSplit for firstOpInput.");
     }

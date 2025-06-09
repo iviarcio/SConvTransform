@@ -375,7 +375,7 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
       inputValue1 = outerLoop.getInductionVar();
       AffineExpr d0;
       bindDims(context, d0);
-      AffineMap m1Map = AffineMap::get(1, 0, {((d0.floorDiv(ow)) * strideH) * fw + ((d0 % ow) * strideW)}, context);
+      AffineMap m1Map = AffineMap::get(1, 0, {((d0.floorDiv(ow)) * strideH) * iw + ((d0 % ow) * strideW)}, context);
       newAffineApply1 = rewriter.create<AffineApplyOp>(loc, m1Map, inputValue1);
 
       auto sliceOp = cast<tensor::ExtractSliceOp>(tensorExtractSlice1);

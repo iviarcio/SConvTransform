@@ -1371,14 +1371,14 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
   if (failed(result0)) return transformOp->emitError("failed to swap indvar Ops");
 
   // ======== For debug only: ========
-  // auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
+  auto rootLoop = dyn_cast<scf::ForOp>(loopOps[0]);
   // llvm::errs() << "\n=== Loops after tiling (& swapInductionVars) === \n" << rootLoop << "\n\n";
 
   // Promote some inner loop Ops depending on the schedule (WS or IS)
   LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, csaConv, res, strides, loopOps);
   if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
 
-  // llvm::errs() << "\n=== Loops after promoteOpsOfTile === \n" << rootLoop << "\n\n";
+  llvm::errs() << "\n=== Loops after tiling & promote === \n" << rootLoop << "\n\n";
 
   // // Generate the filter packing
   LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
@@ -1438,19 +1438,19 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
   auto size = iterationSpace[dim].size;
 
   // ======== for debug only: ========
-  // llvm::errs() << "=== Iteration Domain Sizes ===\n";
-  // for (unsigned i = 0; i < iterationSpace.size(); ++i) {
-  //   llvm::errs() << "Dim " << i << ": ";
-  //   OpFoldResult size = iterationSpace[i].size;
-  //   if (auto attr = size.dyn_cast<Attribute>()) {
-  //     attr.print(llvm::errs());
-  //   } else if (auto val = size.dyn_cast<Value>()) {
-  //     val.print(llvm::errs());
-  //   } else {
-  //     llvm::errs() << "Unknown\n";
-  //   }
-  //   llvm::errs() << "\n";
-  // }
+  llvm::errs() << "=== Iteration Domain Sizes ===\n";
+  for (unsigned i = 0; i < iterationSpace.size(); ++i) {
+    llvm::errs() << "Dim " << i << ": ";
+    OpFoldResult size = iterationSpace[i].size;
+    if (auto attr = size.dyn_cast<Attribute>()) {
+      attr.print(llvm::errs());
+    } else if (auto val = size.dyn_cast<Value>()) {
+      val.print(llvm::errs());
+    } else {
+      llvm::errs() << "Unknown\n";
+    }
+    llvm::errs() << "\n";
+  }
 
   // Ensure splitPoint is an index attribute (static)
   auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
@@ -1578,11 +1578,11 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
 
   // ======== For debug only: ========
-  // llvm::errs() << "=== Splitted kernels ===\n";
-  // llvm::errs() << "First :\n ";
-  // firstOp.print(llvm::errs());
-  // llvm::errs() << "\nLast :\n ";
-  // secondOp.print(llvm::errs());
+  llvm::errs() << "\n=== Splitted kernels ===\n";
+  llvm::errs() << "First :\n ";
+  firstOp.print(llvm::errs());
+  llvm::errs() << "\nLast :\n ";
+  secondOp.print(llvm::errs());
 
   // Apply the tiling for the first part of the split
   SmallVector<Operation*, 7> firstResults;
@@ -1704,14 +1704,14 @@ static LogicalResult splitConvolution(
   }
 
   // ======== For debug only: ========
-  // llvm::errs() << "=== Splitted kernels ===\n";
-  // if (firstOp != nullptr) {
-  //   llvm::errs() << "First :\n";
-  //   firstOp->print(llvm::errs());
-  // }
-  // llvm::errs() << "\nLast :\n";
-  // secondOp->print(llvm::errs());
-  // llvm::errs() << "\nSplit Size used :" << splitSize << "\n";
+  llvm::errs() << "\n=== Splitted kernels ===\n";
+  if (firstOp != nullptr) {
+    llvm::errs() << "First :\n";
+    firstOp->print(llvm::errs());
+  }
+  llvm::errs() << "\nLast :\n";
+  secondOp->print(llvm::errs());
+  llvm::errs() << "\nSplit Size used :" << splitSize << "\n";
 
   return success();
 }
@@ -1991,7 +1991,7 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
     // d0 = batch; d1 = filter; d2 = output height; d3 = output width; d4 = channels; d5 = filter height; d6 = filter width
     AffineExpr d0, d1, d3, d4, d5, d6;
     bindDims(context, d0, d1, d3, d4, d5, d6);
-    auto lhsMap = AffineMap::get(6, 0, {d0, d4, (d3.floorDiv(oh) * hstride + d5 * hdilation) * ih + d3 % oh * wstride + d6 * wdilation}, context);
+    auto lhsMap = AffineMap::get(6, 0, {d0, d4, (d3.floorDiv(oh) * hstride + d5 * hdilation) * iw + d3 % oh * wstride + d6 * wdilation}, context);
     auto rhsMap = AffineMap::get(6, 0, {d1, d4, d5, d6}, context);
     auto resultMap = AffineMap::get(6, 0, {d0, d1, d3}, context);
 
@@ -2014,6 +2014,11 @@ transform::SConvOp::apply(transform::TransformRewriter &rewriter,
 
     // replace convOp with (reshapedOutput + genericOp + reshapedResult)
     rewriter.replaceOp(convOp, ArrayRef<Value>{reshapedResult});
+
+    // ======== For debug only: ========
+    llvm::errs() << "\n=== GenericOp ===\n";
+    genericOp->print(llvm::errs());
+    llvm::errs() << "\n";
 
     // Call the CSA Analysis
     ConvInfo csaConv = {ic, iw, oh, ow, fh, fw, fn, 0, 4};

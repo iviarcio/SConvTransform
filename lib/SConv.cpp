@@ -1485,7 +1485,7 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
 
   return success();
 }
-spli
+
 /// Splits a linalg.generic op along a given dimension and splitPoint.
 /// This assumes the dimension is splittable (CSA already validated bounds).
 std::pair<TilingInterface, TilingInterface>

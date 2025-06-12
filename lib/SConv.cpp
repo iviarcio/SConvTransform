@@ -1601,6 +1601,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   SmallVector<Operation*, 7> firstResults;
   rewriter.setInsertionPoint(target);
 
+  csaConv.split_size_windows = 0;
+  csaConv.split_size_filters = 0;
   if (failed(applyTileTo(rewriter, transformOp, firstOp, csaConv, csa, res, strides, dilations, firstResults))) {
     return transformOp->emitError("Failed to apply tiling on first convOp after split.");
   }
@@ -1619,6 +1621,13 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
 
   // Now, apply the tiling for the last part of the split
   SmallVector<Operation*, 7> secondResults;
+
+  if (res.extra_tile_c == 0) {
+    if ((res.extra_k2 != 0 && res.schd == WS) || (res.extra_k3 !=0 && res.schd == IS))
+      csaConv.split_size_windows = splitSize;
+    else
+      csaConv.split_size_filters = splitSize;
+  }
 
   if (failed(applyTileTo(rewriter, transformOp, secondOp, csaConv, csa, split_res, strides, dilations, secondResults))) {
     return transformOp->emitError("Failed to apply tiling on second convOp after split.");

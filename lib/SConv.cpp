@@ -55,13 +55,13 @@ using namespace mlir::linalg;
 using namespace mlir::transform;
 
 // To debug info, use: transform-opt your_parameters -debug-only=SConv
-#define DEBUG_TYPE "SConv"
+#define DEBUG_TYPE "sconv-transform"
 #define DBGS() (llvm::dbgs() << "\n[" DEBUG_TYPE "] ")
 
 #define GET_OP_CLASSES
 #include "SConv.cpp.inc"
 
-// Define the SConv transform dialect. This uses the CRTP idiom to identify extensions.
+/// Define the SConv transform dialect. This uses the CRTP idiom to identify extensions.
 class SConv
     : public transform::TransformDialectExtension<SConv> {
 public:
@@ -132,7 +132,7 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
   return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
 }
 
-// Delinearizes the given composite `index` by the basis specified in `factors`.
+/// Delinearizes the given composite `index` by the basis specified in `factors`.
 static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
                                       ArrayRef<int64_t> factors) {
   assert(!factors.empty() && "empty factor list");
@@ -145,7 +145,7 @@ static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
   return *multiIndex;
 }
 
-// Compute the linearized input indices considering strides and tensor structure.
+/// Compute the linearized input indices considering strides and tensor structure.
 static Value computeLinearInputIndices(
     OpBuilder &b, Location loc, Value fhIndex, Value fwIndex, Value nwinIndex, Value IOin,
     Value IOout, int64_t Ss, int64_t Ow, int64_t Iw, 
@@ -184,7 +184,7 @@ static Value computeLinearInputIndices(
   return HwIndex;
 }
 
-// Compute the linearized multi-pack input indices considering strides and dilations.
+/// Compute the linearized multi-pack input indices considering strides and dilations.
 static Value computeMultiPackInputIndices(
     OpBuilder &b, Location loc, Value tIndex, Value fhIndex, Value fwIndex, Value nwinIndex,
     Value IOut, int64_t Ss, int64_t Ow, int64_t Iw, int64_t Nwin,
@@ -225,7 +225,7 @@ static Value computeMultiPackInputIndices(
   return HwIndex;
 }
 
-// Some Utility functions used in promoteOpsOfTile
+/// Utility function used in promoteOpsOfTile below
 static Value createLinearizedAffineApply(OpBuilder &rewriter, Location loc,
                                          MLIRContext *context,
                                          Value ILrange, Value ILstart,
@@ -240,6 +240,7 @@ static Value createLinearizedAffineApply(OpBuilder &rewriter, Location loc,
   return rewriter.create<AffineApplyOp>(loc, map, ValueRange{ILrange, ILstart});
 }
 
+/// Utility function used in promoteOpsOfTile below
 static std::pair<Value, Value> computeILstartAndRange(OpBuilder &rewriter, Location loc,
                                                       MLIRContext *context,
                                                       Value inputValue0, Value inputValue1,
@@ -260,6 +261,7 @@ static std::pair<Value, Value> computeILstartAndRange(OpBuilder &rewriter, Locat
   return {ILstart, ILrange};
 }
 
+/// Utility function used in promoteOpsOfTile below
 static Value promoteSimpleAffineApply(OpBuilder &rewriter, Location loc,
                                       MLIRContext *context,
                                       Value d, Value s,
@@ -274,9 +276,9 @@ static Value promoteSimpleAffineApply(OpBuilder &rewriter, Location loc,
   return rewriter.create<AffineApplyOp>(loc, map, ValueRange{d, s});
 }
 
-// After the second level tiling, promote the two affine.apply and the first extracted
-// slice (if chd = IS) or the second extracted slice (if schd = WS), to the outer loop
-// Also, fix the maps of both AffineApplyOps for the linearized input
+/// After the second level tiling, promote the two affine.apply and the first extracted
+/// slice (if chd = IS) or the second extracted slice (if schd = WS), to the outer loop
+/// Also, fix the maps of both AffineApplyOps for the linearized input
 static LogicalResult
 promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv,
                  CSAStrategy res, SmallVector<int64_t, 2> strides,
@@ -447,8 +449,8 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
   return success();
 }
 
-// After the packing operations, the linalOps (uKernel) must be fixed to 
-// access the packed input & filter. Also, fix the iterator types & maps.
+/// After the packing operations, the linalOps (uKernel) must be fixed to 
+/// access the packed input & filter. Also, fix the iterator types & maps.
 static LogicalResult
 adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                 SmallVector<Operation *> &tiledOps, SmallVector<Operation *> loopOps) {
@@ -571,8 +573,8 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   return success();
 }
 
-// Apply the filter packing. This packing will be inserted at the begining of first or
-// second loop level of the internal convolution depends of Input or Wheight Stationary
+/// Apply the filter packing. This packing will be inserted at the begining of first or
+/// second loop level of the internal convolution depends of Input or Wheight Stationary
 static LogicalResult
 applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                   SmallVector<Operation *> &tiledOps, SmallVector<Operation *> loopOps) {
@@ -670,8 +672,8 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
   return success();
 }
 
-// Apply the input packing. This packing will be inserted at the begining of first or
-// second loop level of the internal convolution depends of Input or Wheight Stationary
+/// Apply the input packing. This packing will be inserted at the begining of first or
+/// second loop level of the internal convolution depends of Input or Wheight Stationary
 static LogicalResult
 applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv,
     CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
@@ -792,8 +794,8 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
   return success();
 }
 
-// Swap the inner loops when schedule is Input Stationary. This is a workaround.
-// Apparently, scf::tileUsingSCF innerInterchange has no effect!
+/// Swap the inner loops when schedule is Input Stationary. This is a workaround.
+/// Apparently, scf::tileUsingSCF innerInterchange has no effect!
 static LogicalResult
 swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                   SmallVector<Operation *> &tiledOps, SmallVector<Operation *> &loopOps) {
@@ -855,8 +857,8 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
   return success();
 }
 
-// Pack multiple input tiles, adding another dimension to the packed tensor,
-// and skip K * Nwin elements per iteration on WS schedule.
+/// Pack multiple input tiles, adding another dimension to the packed tensor,
+/// and skip K * Nwin elements per iteration on WS schedule.
 static LogicalResult
 inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv, CSA csa,
     CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
@@ -1088,8 +1090,8 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
   return success();
 }
 
-// Pack multiple filter tiles adding a new dimension to the tensor k2 which
-// iterates over groups of Nf filters on IS.
+/// Pack multiple filter tiles adding a new dimension to the tensor k2 which
+/// iterates over groups of Nf filters on IS.
 static LogicalResult
 filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
                       CSAStrategy res, SmallVector<Operation *> &tiledOps,
@@ -1285,8 +1287,8 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   return success();
 }
 
-// Apply a tiling transformation to a modified payload ops and stores
-// both the tiled operation (uKernel) as well as the created loops.
+/// Apply a tiling transformation to a modified payload ops and stores
+/// both the tiled operation (uKernel) as well as the created loops.
 static LogicalResult
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, ConvInfo csaConv,
     CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
@@ -1382,7 +1384,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
     DBGS() << "=== Loops after promote === \n" << rootLoop << "\n";
   });
 
-  // // Generate the filter packing
+  // Generate the filter packing
   LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result2)) return transformOp->emitError("failed to apply the filter packing");
   // LLVM_DEBUG({
@@ -1517,7 +1519,7 @@ performSplit(RewriterBase &rewriter, TilingInterface op,
     }
   }
 
-  // Perform the actual split
+  // It actually performs the split
   return linalg::splitOp(rewriter, op, dimension, splitPoint);
 }
 
@@ -1647,9 +1649,9 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   return success();
 }
 
-// In the input edge case of the microkernel, the generic's equations assume it starts at the beginning of the row.
-// However, when the row is too small, as in this case, there is a row break in the generic of the last split.
-// The function below adds the splitSize (macro offset) to the equation.
+/// In the input edge case of the microkernel, the generic's equations assume it starts at the beginning of the row.
+/// However, when the row is too small, as in this case, there is a row break in the generic of the last split.
+/// The function below adds the splitSize (macro offset) to the equation.
 static FailureOr<linalg::GenericOp> 
 adjustSecondOpIndexingMap(RewriterBase &rewriter, Operation *secondOp, ConvInfo csaConv,
     SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations, int64_t splitSize) {

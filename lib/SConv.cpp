@@ -109,6 +109,11 @@ void SConv::init() {
       >();
 }
 
+/// Forward deeclarations
+static LogicalResult handleTilingOrSplit(RewriterBase &rewriter, Operation *transformOp, Operation* op,
+    ConvInfo csaConv, CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
+    SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs);
+
 static bool hasAllOneValues(DenseIntElementsAttr attr) {
   return llvm::all_of(
       attr, [](const APInt &element) { return element.getSExtValue() == 1; });
@@ -1523,6 +1528,48 @@ performSplit(RewriterBase &rewriter, TilingInterface op,
   return linalg::splitOp(rewriter, op, dimension, splitPoint);
 }
 
+/// Auxiliary function to perform split
+static LogicalResult splitConvolution(
+    RewriterBase &rewriter, Operation *transformOp, Operation *target, int64_t splitDim,
+    int64_t splitSize, Operation *&firstOp, Operation *&secondOp) {
+
+  auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
+  if (!tilingInterfaceOp)
+    return transformOp->emitError("only TilingInterface ops are supported to split");
+
+  OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
+  if (failed(validateSplitInputs(rewriter, transformOp, tilingInterfaceOp, splitDim, splitPoint))) {
+    return transformOp->emitError("Invalid dimension or splitPoint to call linalg::splitOp");
+  }
+  // In case of splitVal == 0, the payload has only the edge case
+  auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
+  int64_t splitVal = cast<IntegerAttr>(splitAttr).getInt();
+  if (splitVal == 0) {
+    secondOp = tilingInterfaceOp;
+  } else {
+    std::tie(firstOp, secondOp) = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
+  }
+
+  LLVM_DEBUG({
+    DBGS() << "=== Splitted kernels with Dim = " << splitDim << ", Split Size = " << splitSize << " ===\n";
+    if (firstOp != nullptr) {
+      DBGS() << "First :\n";
+      firstOp->print(llvm::dbgs());
+    }
+    DBGS() << "Last :\n";
+    secondOp->print(llvm::dbgs());
+  });
+
+  return success();
+}
+
+/// Helper for splitConvolution
+LogicalResult splitConvHelper(RewriterBase &rewriter, Operation *transformOp,
+                               Operation *target, int64_t splitDim, int64_t splitSize,
+                               Operation *&firstOp, Operation *&secondOp) {
+  return splitConvolution(rewriter, transformOp, target, splitDim, splitSize, firstOp, secondOp);
+}
+
 /// This function will be called when the convolution needs to be Splitted.
 /// It takes the original convolution (`genericOp`), performs the split, and then applies tiling.
 static LogicalResult
@@ -1530,121 +1577,81 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
     CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
     SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs) {
 
-  auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
-  if (!tilingInterfaceOp)
-    return transformOp->emitError("only TilingInterface ops are supported");
-
-  MLIRContext *context = rewriter.getContext();
-  Location loc = target->getLoc();
-
-  // Define the dimension & split point to split the convolution
-  // For now, supported split in one dimension only
-  CSAStrategy split_res = res;
-
-  int64_t splitDim = 0;
+  Operation *currentOp = target;
+  Operation *first = nullptr, *second = nullptr;
   int64_t splitSize = 0;
-  int64_t extraSize = 0;
 
-  if (res.extra_tile_c !=0) {
-    splitDim = 3;
-    splitSize = csaConv.input_channels - res.extra_tile_c;
-    split_res.tile_c = 0;
-  }
-  else if (res.extra_k2 != 0) {
-    if (res.schd == WS) {
-      splitDim = 2;
-      extraSize = csa.mK_.nwindows * res.extra_k2;
-      splitSize = csaConv.output_rows * csaConv.output_cols - extraSize - csaConv.split_size_windows;
-    } else {
-      splitDim = 1;
-      extraSize = csa.mK_.num_filters * res.extra_k2;
-      splitSize = csaConv.num_filters - extraSize - csaConv.split_size_filters;
+  // Helper lambda to apply a split and tile the first result using a modified strategy.
+  auto applySplitAndAdvance = [&](int64_t dim, int64_t size, std::function<void(CSAStrategy&)> strategyAdjuster) -> LogicalResult {
+    // Split the current operation
+    if (failed(splitConvHelper(rewriter, transformOp, currentOp, dim, size, first, second)))
+      return transformOp->emitError("Split failed at dimension ") << dim;
+
+    // Apply the adjustment to a local copy of the strategy (zero out the current edge case)
+    CSAStrategy localRes = res;
+    strategyAdjuster(localRes);
+
+    // Tile the 'first' part with the adjusted strategy
+    if (first) {
+      if (failed(handleTilingOrSplit(rewriter, transformOp, first, csaConv, csa, localRes, strides, dilations, resultLoops, resultConvs)))
+        return transformOp->emitError("Tiling failed for the first part of the split at dimension ") << dim;
     }
-    split_res.k2 = res.extra_k2;
-  }
-  else if (res.extra_k3 != 0) {
-    if (res.schd == IS) {
-      splitDim = 2;
-      extraSize = csa.mK_.nwindows * res.extra_k3;
-      splitSize = csaConv.output_rows * csaConv.output_cols - extraSize - csaConv.split_size_windows;
-    } else {
-      splitDim = 1;
-      extraSize = csa.mK_.num_filters * res.extra_k3;
-      splitSize = csaConv.num_filters - extraSize - csaConv.split_size_filters;
-    }
-    split_res.k3 = res.extra_k3;
-  }
 
-  LLVM_DEBUG({
-    DBGS() << "Split Sizes: (Windows) " << csaConv.split_size_windows << " (Filters) " << csaConv.split_size_filters << "\n";
-  });
+    // Update the current operation for the next iteration
+    currentOp = second;
+    return success();
+  };
 
-  OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
-  if (failed(validateSplitInputs(rewriter, transformOp, tilingInterfaceOp, splitDim, splitPoint))) {
-    return transformOp->emitError("Invalid dimension or splitPoint to call linalg::splitOp"); 
-  }
+  // === Split edge case on k2 first
+  if (res.extra_k2 > 0) {
+    int64_t dim = (res.schd == WS ? 2 : 1);
+    splitSize = (res.schd == WS)
+                  ? csaConv.output_rows * csaConv.output_cols - res.extra_k2 * csa.mK_.nwindows - csaConv.split_size_windows
+                  : csaConv.num_filters - res.extra_k2 * csa.mK_.num_filters - csaConv.split_size_filters;
 
-  // In this case, if splitVal == 0, propagate the error (see splitConvolution)
-  auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
-  int64_t splitVal = cast<IntegerAttr>(splitAttr).getInt();
-  if (splitVal == 0) {
-    return transformOp->emitError() << "Invalid split point " << splitVal << " to call splitOp.";
-  }
-  auto [firstOp, secondOp] = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
-
-  LLVM_DEBUG({
-    DBGS() << "First splitted CSA kernel:\n";
-    firstOp->print(llvm::dbgs());
-    DBGS() << "Second splitted CSA keernel:\n";
-    secondOp->print(llvm::dbgs());
-  });
-
-  // Apply the tiling for the first part of the split
-  SmallVector<Operation*, 7> firstResults;
-  rewriter.setInsertionPoint(target);
-
-  csaConv.split_size_windows = 0;
-  csaConv.split_size_filters = 0;
-  if (failed(applyTileTo(rewriter, transformOp, firstOp, csaConv, csa, res, strides, dilations, firstResults))) {
-    return transformOp->emitError("Failed to apply tiling on first convOp after split.");
-  }
-
-  resultConvs.push_back(firstResults[0]);
-  SmallVector<Operation*, 6> firstLoopSet;
-  for (int i = 1; i <= 6; ++i) {
-    firstLoopSet.push_back(firstResults[i]);
-  }
-  resultLoops.push_back(firstLoopSet);
-
-  LLVM_DEBUG({
-    auto root1Loop = dyn_cast<scf::ForOp>(firstResults[1]);
-    DBGS() << "=== Loops after tiling for 1st splitted CSA kernel: \n" << root1Loop << "\n";
-  });
-
-  // Now, apply the tiling for the last part of the split
-  SmallVector<Operation*, 7> secondResults;
-
-  if (res.extra_tile_c == 0) {
-    if ((res.extra_k2 != 0 && res.schd == WS) || (res.extra_k3 !=0 && res.schd == IS))
+    if (res.schd == WS)
       csaConv.split_size_windows = splitSize;
     else
       csaConv.split_size_filters = splitSize;
+
+    if (failed(applySplitAndAdvance(dim, splitSize, [](CSAStrategy &r) { r.extra_k2 = 0; })))
+      return failure();
+    res.k2 = res.extra_k2;
+    res.extra_k2 = 0;
   }
 
-  if (failed(applyTileTo(rewriter, transformOp, secondOp, csaConv, csa, split_res, strides, dilations, secondResults))) {
-    return transformOp->emitError("Failed to apply tiling on second convOp after split.");
-  }
-  resultConvs.push_back(secondResults[0]);
-  SmallVector<Operation*, 6> secondLoopSet;
-  for (int i = 1; i < secondResults.size(); ++i) {
-    secondLoopSet.push_back(secondResults[i]);
-  }
-  resultLoops.push_back(secondLoopSet);
+  // === Split edge case on k3 next
+  if (res.extra_k3 > 0) {
+    int64_t dim = (res.schd == IS ? 2 : 1);
+    splitSize = (res.schd == IS)
+                  ? csaConv.output_rows * csaConv.output_cols - res.extra_k3 * csa.mK_.nwindows - csaConv.split_size_windows
+                  : csaConv.num_filters - res.extra_k3 * csa.mK_.num_filters - csaConv.split_size_filters;
 
-  LLVM_DEBUG({
-    auto root2Loop = dyn_cast<scf::ForOp>(secondResults[1]);
-    DBGS() << "=== Loops after tiling for 2nd splitted CSA kernel: \n" << root2Loop << "\n";
-  });
+    if (res.schd == IS)
+      csaConv.split_size_windows = splitSize;
+    else
+      csaConv.split_size_filters = splitSize;
+
+    if (failed(applySplitAndAdvance(dim, splitSize, [](CSAStrategy &r) { r.extra_k3 = 0; })))
+      return failure();
+    res.k3 = res.extra_k3;
+    res.extra_k3 = 0;
+  }
+
+  // === Split edge case on tile_c last
+  if (res.extra_tile_c > 0) {
+    int64_t dim = 3; // always the channel dimension
+    splitSize = csaConv.input_channels - res.extra_tile_c;
+
+    if (failed(applySplitAndAdvance(dim, splitSize, [](CSAStrategy &r) { r.extra_tile_c = 0; })))
+      return failure();
+    res.tile_c = res.extra_tile_c;
+    res.extra_tile_c = 0;
+  }
+
+  // Apply tiling to the final (last) portion of the convolution
+  if (failed(handleTilingOrSplit(rewriter, transformOp, currentOp, csaConv, csa, res, strides, dilations, resultLoops, resultConvs)))
+    return transformOp->emitError("Tiling failed on final convolution after all splits.");
 
   return success();
 }
@@ -1701,41 +1708,6 @@ adjustSecondOpIndexingMap(RewriterBase &rewriter, Operation *secondOp, ConvInfo 
   genericOp->setAttr("indexing_maps", ArrayAttr::get(context, attrMaps));
 
   return genericOp;
-}
-
-/// Auxiliary function to perform split
-static LogicalResult splitConvolution(
-    RewriterBase &rewriter, Operation *transformOp, Operation *target, int64_t splitDim,
-    int64_t splitSize, Operation *&firstOp, Operation *&secondOp) {
-
-  auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
-  if (!tilingInterfaceOp)
-    return transformOp->emitError("only TilingInterface ops are supported to split");
-
-  OpFoldResult splitPoint = rewriter.getIndexAttr(splitSize);
-  if (failed(validateSplitInputs(rewriter, transformOp, tilingInterfaceOp, splitDim, splitPoint))) {
-    return transformOp->emitError("Invalid dimension or splitPoint to call linalg::splitOp");
-  }
-  // In case of splitVal == 0, the payload has only the edge case
-  auto splitAttr = llvm::dyn_cast_if_present<Attribute>(splitPoint);
-  int64_t splitVal = cast<IntegerAttr>(splitAttr).getInt();
-  if (splitVal == 0) {
-    secondOp = tilingInterfaceOp;
-  } else {
-    std::tie(firstOp, secondOp) = performSplit(rewriter, tilingInterfaceOp, splitDim, splitPoint);
-  }
-
-  LLVM_DEBUG({
-    DBGS() << "=== Splitted kernels with Dim = " << splitDim << ", Split Size = " << splitSize << " ===\n";
-    if (firstOp != nullptr) {
-      DBGS() << "First :\n";
-      firstOp->print(llvm::dbgs());
-    }
-    DBGS() << "Last :\n";
-    secondOp->print(llvm::dbgs());
-  });
-
-  return success();
 }
 
 /// Auxiliary function to handle CSA edge case and/or apply tiling

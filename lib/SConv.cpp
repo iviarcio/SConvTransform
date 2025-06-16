@@ -137,6 +137,24 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
   return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
 }
 
+/// Validate if split_size_windows must be computed in the affine maps
+int64_t getValidSplitSize(const CSA &csa, const ConvInfo &csaConv, const CSAStrategy &res) {
+
+  int64_t expectedSplitSize = 0;
+  int64_t splitSize = (csaConv.output_rows * csaConv.output_cols) % csa.mK_.nwindows;
+
+  if (res.schd == WS) {
+    expectedSplitSize = csaConv.output_rows * csaConv.output_cols - res.k2 * csa.mK_.nwindows - splitSize;
+    if (csaConv.split_size_windows == expectedSplitSize)
+      return csaConv.split_size_windows;
+  } else if (res.schd == IS) {
+    expectedSplitSize = csaConv.output_rows * csaConv.output_cols - res.k3 * csa.mK_.nwindows - splitSize;
+    if (csaConv.split_size_windows == expectedSplitSize)
+      return csaConv.split_size_windows;
+  }
+  return 0;
+}
+
 /// Delinearizes the given composite `index` by the basis specified in `factors`.
 static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
                                       ArrayRef<int64_t> factors) {
@@ -285,9 +303,9 @@ static Value promoteSimpleAffineApply(OpBuilder &rewriter, Location loc,
 /// slice (if chd = IS) or the second extracted slice (if schd = WS), to the outer loop
 /// Also, fix the maps of both AffineApplyOps for the linearized input
 static LogicalResult
-promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv,
-                 CSAStrategy res, SmallVector<int64_t, 2> strides,
-                 SmallVector<Operation *> loopOps) {
+promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, CSA csa, 
+    ConvInfo csaConv, CSAStrategy res, SmallVector<int64_t, 2> strides,
+    SmallVector<Operation *> loopOps) {
 
   int idx = (res.k2 == 0 || res.k3 == 0 || res.tile_c == 0) ? 3 : 4;
   auto root2Loop = dyn_cast<scf::ForOp>(loopOps[idx - 1]);
@@ -346,10 +364,10 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCon
   int64_t ow = csaConv.output_cols;
   int64_t fh = csaConv.kernel_rows;
   int64_t fw = csaConv.kernel_cols;
-  int64_t ss = csaConv.split_size_windows;
   int64_t strideH = strides[0];
   int64_t strideW = strides[1];
 
+  int64_t ss = getValidSplitSize(csa, csaConv, res);
 
   if (!pointwise) inputValue0 = affineApply0->getOperand(0);
 
@@ -757,7 +775,7 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
   // create the input packing
   Value IO_in  = dyn_cast<scf::ForOp>(loopOps[loopIndex]).getInductionVar();
   Value IO_out = dyn_cast<scf::ForOp>(loopOps[outerIndex]).getInductionVar();
-  int64_t ss = csaConv.split_size_windows;
+  int64_t ss = getValidSplitSize(csa, csaConv, res);
 
   auto packingTensor = rewriter.create<linalg::GenericOp>(
     loc, inputPacking.getType(),
@@ -937,7 +955,7 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
   SmallVector<AffineMap, 6> packingIndexingMaps = {AffineMap::getMultiDimIdentityMap(nloops, context)};
 
   Value IO_out = nestLoop.getInductionVar();
-  int64_t ss = csaConv.split_size_windows;
+  int64_t ss = getValidSplitSize(csa, csaConv, res);
 
   auto newPackingTensor = rewriter.create<linalg::GenericOp>(
     loc, inputPacking.getType(),
@@ -1383,7 +1401,7 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
   // });
 
   // Promote some inner loop Ops depending on the schedule (WS or IS)
-  LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, csaConv, res, strides, loopOps);
+  LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, csa, csaConv, res, strides, loopOps);
   if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
   LLVM_DEBUG({
     DBGS() << "=== Loops after promote === \n" << rootLoop << "\n";
@@ -1564,11 +1582,44 @@ static LogicalResult splitConvolution(
 }
 
 /// Helper for splitConvolution
-LogicalResult splitConvHelper(RewriterBase &rewriter, Operation *transformOp,
-                               Operation *target, int64_t splitDim, int64_t splitSize,
-                               Operation *&firstOp, Operation *&secondOp) {
+static LogicalResult
+splitConvHelper(RewriterBase &rewriter, Operation *transformOp,
+    Operation *target, int64_t splitDim, int64_t splitSize,
+    Operation *&firstOp, Operation *&secondOp) {
   return splitConvolution(rewriter, transformOp, target, splitDim, splitSize, firstOp, secondOp);
 }
+
+/// Helper to apply a split and tile the first result using a modified strategy.
+static LogicalResult
+applySplitAndAdvance(RewriterBase &rewriter, Operation *transformOp,
+    Operation *&currentOp, int64_t dim, int64_t size, CSAStrategy res,
+    ConvInfo csaConv, CSA &csa, SmallVector<int64_t, 2> strides,
+    SmallVector<int64_t, 2> dilations, const int64_t curEdgeCase,
+    SmallVector<SmallVector<Operation *, 6>> &resultLoops,
+    SmallVector<Operation *> &resultConvs) {
+
+  Operation *first = nullptr, *second = nullptr;
+
+  // Split the current operation
+  if (failed(splitConvHelper(rewriter, transformOp, currentOp, dim, size, first, second)))
+    return transformOp->emitError("Split failed at dimension ") << dim;
+
+  // Apply the adjustment to a local copy of the strategy (zero out the current edge case)
+  CSAStrategy localRes = res;
+  if (curEdgeCase == 0) localRes.extra_k2 = 0;
+  else if (curEdgeCase == 1) localRes.extra_k3 = 0;
+  else localRes.extra_tile_c = 0;
+
+  // Tile the 'first' part with the adjusted strategy
+  if (first) {
+    if (failed(handleTilingOrSplit(rewriter, transformOp, first, csaConv, csa, localRes, strides, dilations, resultLoops, resultConvs)))
+      return transformOp->emitError("Tiling failed for the first part of the split at dimension ") << dim;
+  }
+
+  // Update the current operation for the next iteration
+  currentOp = second;
+  return success();
+};
 
 /// This function will be called when the convolution needs to be Splitted.
 /// It takes the original convolution (`genericOp`), performs the split, and then applies tiling.
@@ -1578,29 +1629,7 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
     SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs) {
 
   Operation *currentOp = target;
-  Operation *first = nullptr, *second = nullptr;
   int64_t splitSize = 0;
-
-  // Helper lambda to apply a split and tile the first result using a modified strategy.
-  auto applySplitAndAdvance = [&](int64_t dim, int64_t size, std::function<void(CSAStrategy&)> strategyAdjuster) -> LogicalResult {
-    // Split the current operation
-    if (failed(splitConvHelper(rewriter, transformOp, currentOp, dim, size, first, second)))
-      return transformOp->emitError("Split failed at dimension ") << dim;
-
-    // Apply the adjustment to a local copy of the strategy (zero out the current edge case)
-    CSAStrategy localRes = res;
-    strategyAdjuster(localRes);
-
-    // Tile the 'first' part with the adjusted strategy
-    if (first) {
-      if (failed(handleTilingOrSplit(rewriter, transformOp, first, csaConv, csa, localRes, strides, dilations, resultLoops, resultConvs)))
-        return transformOp->emitError("Tiling failed for the first part of the split at dimension ") << dim;
-    }
-
-    // Update the current operation for the next iteration
-    currentOp = second;
-    return success();
-  };
 
   // === Split edge case on k2 first
   if (res.extra_k2 > 0) {
@@ -1614,7 +1643,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
     else
       csaConv.split_size_filters = splitSize;
 
-    if (failed(applySplitAndAdvance(dim, splitSize, [](CSAStrategy &r) { r.extra_k2 = 0; })))
+    if (failed(applySplitAndAdvance(rewriter, transformOp, currentOp, dim, splitSize,
+            res, csaConv, csa, strides, dilations, 0, resultLoops, resultConvs)))
       return failure();
     res.k2 = res.extra_k2;
     res.extra_k2 = 0;
@@ -1632,7 +1662,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
     else
       csaConv.split_size_filters = splitSize;
 
-    if (failed(applySplitAndAdvance(dim, splitSize, [](CSAStrategy &r) { r.extra_k3 = 0; })))
+    if (failed(applySplitAndAdvance(rewriter, transformOp, currentOp, dim, splitSize,
+            res, csaConv, csa, strides, dilations, 1, resultLoops, resultConvs)))
       return failure();
     res.k3 = res.extra_k3;
     res.extra_k3 = 0;
@@ -1643,7 +1674,8 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
     int64_t dim = 3; // always the channel dimension
     splitSize = csaConv.input_channels - res.extra_tile_c;
 
-    if (failed(applySplitAndAdvance(dim, splitSize, [](CSAStrategy &r) { r.extra_tile_c = 0; })))
+    if (failed(applySplitAndAdvance(rewriter, transformOp, currentOp, dim, splitSize,
+            res, csaConv, csa, strides, dilations, 2, resultLoops, resultConvs)))
       return failure();
     res.tile_c = res.extra_tile_c;
     res.extra_tile_c = 0;
@@ -1723,10 +1755,6 @@ static LogicalResult handleTilingOrSplit(RewriterBase &rewriter, Operation *tran
     SmallVector<Operation*, 7> firstResults;
     rewriter.setInsertionPoint(op);
 
-    // In this phase, csaConv.split_sizes equals 0. The action below does not
-    // affect the previous values  because csaConv is passed by value.
-    csaConv.split_size_windows = 0;
-    csaConv.split_size_filters = 0;
     if (failed(applyTileTo(rewriter, transformOp, op, csaConv, csa, res, strides, dilations, firstResults)))
       return transformOp->emitError("Failed to apply tiling.");
 

@@ -137,6 +137,15 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
   return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
 }
 
+static tensor::CollapseShapeOp findCollapseUsing(Value src, Block *body) {
+  tensor::CollapseShapeOp result = nullptr;
+  body->walk([&](tensor::CollapseShapeOp op) {
+    if (op.getSrc() == src)
+      result = op;
+  });
+  return result;
+}
+
 /// Validate if split_size_windows must be computed in the affine maps
 int64_t getValidSplitSize(const CSA &csa, const ConvInfo &csaConv, const CSAStrategy &res) {
 
@@ -1022,6 +1031,9 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
     linalgOp = op; // It's the last one in the loop
   });
 
+  // Get the old CollapseShapeOp
+  auto oldCollapseOp = findCollapseUsing(oInputPacking.getResult(0), innerLoop.getBody());
+
   // Set the insertion point to old uKernel
   rewriter.setInsertionPoint(linalgOp);
 
@@ -1094,6 +1106,7 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
   opsToRemove.push_back(affineApply3);
   opsToRemove.push_back(extractedSlice); 
   opsToRemove.push_back(oInputPacking);
+  opsToRemove.push_back(oldCollapseOp);
 
   for (Operation *op : llvm::reverse(opsToRemove)) {
     if (op && op->use_empty()) {
@@ -1237,6 +1250,9 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
     linalgOp = op; // It's the last one in the loop
   });
 
+  // Get the old CollapseShapeOp
+  auto oldCollapseOp = findCollapseUsing(oFilterPacking.getResult(0), innerLoop.getBody());
+
   // Set the insertion point to old uKernel
   rewriter.setInsertionPoint(linalgOp);
 
@@ -1291,6 +1307,7 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   opsToRemove.push_back(emptyOp);
   opsToRemove.push_back(extractedSlice); 
   opsToRemove.push_back(oFilterPacking);
+  opsToRemove.push_back(oldCollapseOp);
 
   for (Operation *op : llvm::reverse(opsToRemove)) {
     if (op && op->use_empty()) {
@@ -1403,9 +1420,9 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
   // Promote some inner loop Ops depending on the schedule (WS or IS)
   LogicalResult result1 = promoteOpsOfTile(rewriter, transformOp, csa, csaConv, res, strides, loopOps);
   if (failed(result1)) return transformOp->emitError("failed to hosting Ops");
-  LLVM_DEBUG({
-    DBGS() << "=== Loops after promote === \n" << rootLoop << "\n";
-  });
+  // LLVM_DEBUG({
+  //   DBGS() << "=== Loops after promote === \n" << rootLoop << "\n";
+  // });
 
   // Generate the filter packing
   LogicalResult result2 = applyFilterPacking(rewriter, transformOp, res, tiledOps, loopOps);
@@ -1424,16 +1441,16 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
   // Fix the uKernel after packing input & filter
   LogicalResult result4 = adjustLinalgOps(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result4)) return transformOp->emitError("failed to replace the uKernel after packing");
-  // LLVM_DEBUG({
-  //   DBGS() << "=== Loops after adjustLinalgOps === \n" << rootLoop << "\n";
-  // });
+  LLVM_DEBUG({
+    DBGS() << "=== Loops after adjustLinalgOps === \n" << rootLoop << "\n";
+  });
 
   // Generate the filter Multi-Packing
   LogicalResult result5 = filterMultipackingOpt(rewriter, transformOp, res, tiledOps, loopOps);
   if (failed(result5)) return transformOp->emitError("failed to apply filter Multi-Packing optimization");
-  // LLVM_DEBUG({
-  //   DBGS() << "=== Loops after filterMultipackingOpt === \n" << rootLoop << "\n";
-  // });
+  LLVM_DEBUG({
+    DBGS() << "=== Loops after filterMultipackingOpt === \n" << rootLoop << "\n";
+  });
 
   // Generate the input Multi-Packing
   LogicalResult result6 = inputMultipackingOpt(rewriter, transformOp, csaConv, csa, res, strides, dilations, tiledOps, loopOps);

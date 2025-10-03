@@ -55,10 +55,6 @@ using namespace mlir::affine;
 using namespace mlir::linalg;
 using namespace mlir::transform;
 
-// To debug info, use: transform-opt your_parameters -debug-only=SConv
-#define DEBUG_TYPE "sconv-transform"
-#define DBGS() (llvm::dbgs() << "\n[" DEBUG_TYPE "] ")
-
 #define GET_OP_CLASSES
 #include "SConv.cpp.inc"
 
@@ -109,43 +105,6 @@ void SConv::init() {
 #define GET_OP_LIST
 #include "SConv.cpp.inc"
       >();
-}
-
-/// Forward deeclarations
-static LogicalResult handleTilingOrSplit(RewriterBase &rewriter, Operation *transformOp, Operation* op,
-    ConvInfo csaConv, CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
-    SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs);
-
-static bool hasAllOneValues(DenseIntElementsAttr attr) {
-  return llvm::all_of(
-      attr, [](const APInt &element) { return element.getSExtValue() == 1; });
-}
-
-static Value createAdd(Location loc, Value x, Value y, OpBuilder &builder) {
-  if (isa<IntegerType>(x.getType()))
-    return builder.create<arith::AddIOp>(loc, x, y);
-  return builder.create<arith::AddFOp>(loc, x, y);
-}
-
-static Value createMul(Location loc, Value x, Value y, Type accType,
-                       OpBuilder &builder) {
-  // Linalg named ops specify signed extend for named ops.
-  Value xConvert =
-      convertScalarToDtype(builder, loc, x, accType, /*isUnsignedCast=*/false);
-  Value yConvert =
-      convertScalarToDtype(builder, loc, y, accType, /*isUnsignedCast=*/false);
-  if (isa<IntegerType>(accType))
-    return builder.create<arith::MulIOp>(loc, xConvert, yConvert);
-  return builder.create<arith::MulFOp>(loc, xConvert, yConvert);
-}
-
-static tensor::CollapseShapeOp findCollapseUsing(Value src, Block *body) {
-  tensor::CollapseShapeOp result = nullptr;
-  body->walk([&](tensor::CollapseShapeOp op) {
-    if (op.getSrc() == src)
-      result = op;
-  });
-  return result;
 }
 
 /// Validate if split_size_windows must be computed in the affine maps

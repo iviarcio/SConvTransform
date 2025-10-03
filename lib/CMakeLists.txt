@@ -6,6 +6,7 @@ add_mlir_library(
   # Built from the following source files.
   SConv.cpp
   CSA.cpp
+  SplitToShards.cpp
   LowerToBLAS.cpp
 
   # Make includes visible without top-level path.

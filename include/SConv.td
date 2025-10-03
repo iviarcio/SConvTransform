@@ -67,6 +67,19 @@ def SConvOp : Op<Transform_Dialect, "structured.sconv",
 
 }
 
+def SplitToShardsOp : Op<Transform_Dialect, "split.to_shards",
+    [DeclareOpInterfaceMethods<TransformOpInterface>,
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Split the micro-kernels into 4 shards.";
+  let description = [{}];
+  let arguments = (ins
+    TransformHandleTypeInterface:$target
+  );
+  let results = (outs TransformHandleTypeInterface:$output);
+  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def LowerToBlasOp : Op<Transform_Dialect, "lower.to_blas",
     [DeclareOpInterfaceMethods<TransformOpInterface>,
      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {

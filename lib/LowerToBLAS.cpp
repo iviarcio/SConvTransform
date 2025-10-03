@@ -36,10 +36,10 @@ using namespace mlir::transform;
 
 using LLVMCallOp = LLVM::CallOp;
 
-#define DEBUG_TYPE "sconv-lowering"
+#define DEBUG_TY "sconv-lowering"
 
 #define DEBUG(expr)                                                            \
-  LLVM_DEBUG(llvm::dbgs() << "[" << DEBUG_TYPE << "] " << expr << "\n")
+  LLVM_DEBUG(llvm::dbgs() << "[" << DEBUG_TY << "] " << expr << "\n")
 
 //===----------------------------------------------------------------------===//
 // Lowering to BLAS

@@ -169,10 +169,11 @@ static FailureOr<Operation *> splitKernelIntoShards(TransformRewriter &rewriter,
                                                     Operation *kernelOp) {
 
   // split kernelOp along "Oc" into 4 shards.
-  auto schedAttr = kernelOp->getAttrOfType<mlir::StringAttr>("schedule");
-  assert(schedAttr && "expected 'schedule' string attr on ukernel");
-  llvm::StringRef sched = schedAttr.getValue();
-  int64_t splitDim = (sched == "IS") ? 3 : 2;
+  // auto schedAttr = kernelOp->getAttrOfType<mlir::StringAttr>("schedule");
+  // assert(schedAttr && "expected 'schedule' string attr on ukernel");
+  // llvm::StringRef sched = schedAttr.getValue();
+  // int64_t splitDim = (sched == "IS") ? 3 : 2;
+  int64_t splitDim = 3;
 
   auto op = dyn_cast<TilingInterface>(kernelOp);
   auto iterationSpace = op.getIterationDomain(rewriter);

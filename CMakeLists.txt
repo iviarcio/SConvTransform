@@ -34,11 +34,11 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_subdirectory(include)
 add_subdirectory(lib)
 
-add_dependencies(SConv transform-opt)
-add_llvm_executable(transform-opt
-  transform-opt/transform-opt.cpp)
+add_dependencies(SConv sconv-opt)
+add_llvm_executable(sconv-opt
+  sconv-opt/sconv-opt.cpp)
 
-target_link_libraries(transform-opt
+target_link_libraries(sconv-opt
   PRIVATE
   MLIRIR
   MLIRMlirOptMain

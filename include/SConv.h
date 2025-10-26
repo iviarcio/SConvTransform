@@ -6,8 +6,31 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines Transform dialect extension operations used in the SConv.
+// @brief MLIR Transform dialect extension for the Sliced Convolution (SConv).
 //
+// WHAT
+//   This header declares the SConv Transform extension and its custom ops
+//   (generated via ODS). SConv takes linalg 2D convolutions (NCHW/FCHW) and
+//   lowers them to tiled/packed linalg.generic micro-kernels guided by a
+//   Convolution Slicing Analysis (CSA).
+//
+// WHY
+//   The goal is to expose a reusable, analyzable transformation pipeline that
+//   captures tiling, edge-case splitting, packing and (optionally) multipacking
+//   in a declarative way (Transform dialect).
+//
+// HOW (high-level)
+//   - Named convs → normalized linalg.generic with collapsed H×W.
+//   - CSA decides schedule (IS/WS) and tile sizes (Nc, K2, K3).
+//   - Edge-case splits (input/filter domains and CSA remainders).
+//   - Two-level tiling and packing (plus multipacking when applicable).
+//   - Affine maps implement the packing equations in the paper (Section 4).
+//
+// Usage (Transform interpreter)
+//   registerSConv(registry);    // during tool initialization
+//   // In a .mlir transform file: transform.structured.sconv ...
+//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 
 #ifndef SCONV_H
@@ -46,7 +69,7 @@ class DialectRegistry;
 #define GET_OP_CLASSES
 #include "SConv.h.inc"
 
-// Registers our Transform dialect extension.
+// Register SConv Transform dialect extension.
 void registerSConv(::mlir::DialectRegistry &registry);
 
 //===----------------------------------------------------------------------===//

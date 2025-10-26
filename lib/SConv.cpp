@@ -6,8 +6,23 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines Transform dialect extension operations used in the SConv.
+// @brief Implements the SConv Transform dialect extension (init + ops).
 //
+// Debugging
+//   Use: `transform-opt <args> -debug-only=SConv`
+//
+// Dialect loading
+//   - Dependent dialects (used by transform ops): Linalg.
+//   - Generated dialects (may appear in payload results): Affine, Arith, Index,
+//     SCF, Tensor.
+//
+// Paper anchors
+//   - CSA and schedule selection (IS/WS): Section 2.2 / 5.2
+//   - Edge-case splitting: Section 5.3
+//   - Two-level tiling: Section 5.4
+//   - Packing + Multipacking (affine maps): Section 4 / 5.5
+//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //===----------------------------------------------------------------------===//
 
 #include "SConv.h"
@@ -111,10 +126,9 @@ void SConv::init() {
       >();
 }
 
-/// Forward deeclarations
-static LogicalResult handleTilingOrSplit(RewriterBase &rewriter, Operation *transformOp, Operation* op,
-    ConvInfo csaConv, CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
-    SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs);
+// ====--------------------------------------------------------------------------
+// Utilities for arithmetic on index values, and others.
+// ====--------------------------------------------------------------------------
 
 static bool hasAllOneValues(DenseIntElementsAttr attr) {
   return llvm::all_of(
@@ -148,7 +162,31 @@ static tensor::CollapseShapeOp findCollapseUsing(Value src, Block *body) {
   return result;
 }
 
-/// Validate if split_size_windows must be computed in the affine maps
+/// Forward declaration — see definition below for full description.
+static LogicalResult handleTilingOrSplit(RewriterBase &rewriter, Operation *transformOp, Operation* op,
+    ConvInfo csaConv, CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
+    SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs);
+
+
+/// @brief Compute the effective split size (`ss`) for linearized H×W windows.
+///
+/// SConv sometimes needs a correction when the flattened output spatial
+/// dimension (Oh*Ow) is not an integer multiple of Nwin. In that case, CSA
+/// may produce a split of the epilogue: the “steady-state” runs with fully
+/// aligned tiles and an epilogue handles the tail. This function validates
+/// whether the `split_size_windows` attached to ConvInfo matches the CSA
+/// schedule (IS or WS) and returns it; otherwise returns 0.
+///
+/// @param csa       Convolution Slicing Analysis parameters (Nc, K2, K3, Nwin).
+/// @param csaConv   Concrete convolution instance (shapes, precomputed sizes).
+/// @param res       CSA strategy result (schedule and per-level tiling).
+/// @returns         A non-zero `ss` if an edge-split must be reflected in the
+///                  input affine formulas (Section 4, Eq. 15); 0 otherwise.
+///
+/// @note Paper reference: Section 4 (Input packing), especially Edge Packing
+///       and Eq. (15) where an extra offset (`Eoff`) participates in Ts.
+///
+/// @see computeLinearInputIndices, computeMultiPackInputIndices
 int64_t getValidSplitSize(const CSA &csa, const ConvInfo &csaConv, const CSAStrategy &res) {
 
   int64_t expectedSplitSize = 0;
@@ -179,7 +217,28 @@ static SmallVector<Value> unrollIndex(OpBuilder &b, Location loc, Value index,
   return *multiIndex;
 }
 
-/// Compute the linearized input indices considering strides and tensor structure.
+/// @brief Compute the linearized input index for a packed window element.
+///
+/// This materializes the affine expression that maps (Fh, Fw, Nwin) within a
+/// tile to the source tensor’s linearized H×W dimension, honoring stride and
+/// dilation. It corresponds to Section 4 equations for the “general case”
+/// where row breaks can occur (Eqs. 11–12 combined with Eq. 8).
+///
+/// Symbols/Dims (notation parity with the paper):
+///   - Ow: output width (windows per row).
+///   - Iw: input width (columns of the input tensor).
+///   - Ss: epilogue split-size in windows (0 if none).
+///   - IOin/IOout: inner/outer loop iters selecting the current H×W tile.
+///   - fhIndex, fwIndex, nwinIndex: local indices in {Fh, Fw, Nwin}.
+///
+/// Affine structure:
+///   ILstart = IOin + IOout + Ss
+///   iHw = (((ILstart + nwin) / Ow - ILstart / Ow) * strideH + fh*dilationH) * Iw
+///         + ((ILstart + nwin) % Ow - ILstart % Ow) * strideW + fw*dilationW
+///
+/// @note Paper reference: Section 4, Eqs. (11), (12) and (8).
+///
+/// @see computeMultiPackInputIndices
 static Value computeLinearInputIndices(
     OpBuilder &b, Location loc, Value fhIndex, Value fwIndex, Value nwinIndex, Value IOin,
     Value IOout, int64_t Ss, int64_t Ow, int64_t Iw, 
@@ -218,7 +277,20 @@ static Value computeLinearInputIndices(
   return HwIndex;
 }
 
-/// Compute the linearized multi-pack input indices considering strides and dilations.
+/// @brief Like computeLinearInputIndices, but for multi-packing
+///
+/// Multipacking adds a tile index `t` and skips full tiles at a higher level:
+///   ILstart = IOout + Ss              (tiled at outer level)
+///   iHw uses: (ILstart + t*Nwin + nwin)  // Eq. (14)
+///
+/// This is Section 4.2.1 (Multipacking), using Eq. (13) for Ts and Eq. (14)
+/// for O_hw. Stride/dilation are applied identically to the single-pack case.
+///
+/// @note Paper reference: Section 4.2.1, Eqs. (13–14).
+///
+/// Preconditions:
+///   - `res.schd == WS` (weight stationary) in the calling context.
+///   - `Nwin` equals the microkernel window width.
 static Value computeMultiPackInputIndices(
     OpBuilder &b, Location loc, Value tIndex, Value fhIndex, Value fwIndex, Value nwinIndex,
     Value IOut, int64_t Ss, int64_t Ow, int64_t Iw, int64_t Nwin,
@@ -259,7 +331,12 @@ static Value computeMultiPackInputIndices(
   return HwIndex;
 }
 
-/// Utility function used in promoteOpsOfTile below
+//===----------------------------------------------------------------------===//
+// Helpers for promoteOpsOfTile
+//===----------------------------------------------------------------------===//
+
+/// @brief Build an affine.apply that computes the flattened H×W index for a window.
+tility function used in promoteOpsOfTile below
 static Value createLinearizedAffineApply(OpBuilder &rewriter, Location loc,
                                          MLIRContext *context,
                                          Value ILrange, Value ILstart,
@@ -274,7 +351,7 @@ static Value createLinearizedAffineApply(OpBuilder &rewriter, Location loc,
   return rewriter.create<AffineApplyOp>(loc, map, ValueRange{ILrange, ILstart});
 }
 
-/// Utility function used in promoteOpsOfTile below
+/// @brief Compute the starting linear index (ILstart) and window range offsets for the current tile.
 static std::pair<Value, Value> computeILstartAndRange(OpBuilder &rewriter, Location loc,
                                                       MLIRContext *context,
                                                       Value inputValue0, Value inputValue1,
@@ -295,7 +372,7 @@ static std::pair<Value, Value> computeILstartAndRange(OpBuilder &rewriter, Locat
   return {ILstart, ILrange};
 }
 
-/// Utility function used in promoteOpsOfTile below
+/// @brief Hoist a pure affine.apply operation from the inner loop to the outer loop, preserving SSA uses.
 static Value promoteSimpleAffineApply(OpBuilder &rewriter, Location loc,
                                       MLIRContext *context,
                                       Value d, Value s,
@@ -310,9 +387,34 @@ static Value promoteSimpleAffineApply(OpBuilder &rewriter, Location loc,
   return rewriter.create<AffineApplyOp>(loc, map, ValueRange{d, s});
 }
 
-/// After the second level tiling, promote the two affine.apply and the first extracted
-/// slice (if chd = IS) or the second extracted slice (if schd = WS), to the outer loop
-/// Also, fix the maps of both AffineApplyOps for the linearized input
+/// @brief Hoist key affine.apply and extract_slice ops across loop levels.
+///
+/// After second-level tiling, we want the affine index computation for the
+/// linearized input, and the first extract_slice (IS) or second (WS), to live
+/// at the outer loop so that (a) the maps become invariant within the inner
+/// microkernel loop and (b) we can rewrite them with the closed-form
+/// formulas derived in Section 4.
+///
+/// Behavior:
+///   - For IS: hoist affine.apply to the *outer* loop and promote the first
+///     extract_slice. For certain rectangular convs with Fh==1, also patch
+///     the slice to index via the new affine.apply.
+///   - For WS: compute affine.apply at *inner* loop (needs inner iv), promote
+///     the second extract_slice to the outer loop.
+///
+/// Preconditions:
+///   - `loopOps[idx-1], loopOps[idx], loopOps[idx+1]` must be valid scf.for.
+///   - The inner loop body must contain at least two tensor.extract_slice
+///     (input, filter) and optionally the affine.apply we want to hoist.
+///   - Tiling already produced the (root2, outer, inner) loops in order.
+///
+/// Notes:
+///   - When `pointwise==true` we guard the affine path and only patch slices.
+///   - The “split size” `ss` is folded in the new affine maps (see getValidSplitSize).
+///
+/// @returns success() on successful promotion; emitError otherwise.
+///
+/// @see Section 5.4 (tiling structure) and Section 4 (affine index rewrites).
 static LogicalResult
 promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, CSA csa, 
     ConvInfo csaConv, CSAStrategy res, SmallVector<int64_t, 2> strides,
@@ -483,8 +585,30 @@ promoteOpsOfTile(RewriterBase &rewriter, Operation *transformOp, CSA csa,
   return success();
 }
 
-/// After the packing operations, the linalOps (uKernel) must be fixed to 
-/// access the packed input & filter. Also, fix the iterator types & maps.
+/// @brief Rewrite the ukernel linalg.generic to consume packed tensors.
+///
+/// Once packing is in place, the inner linalg.generic (ukernel) must read the
+/// packed input/filter and expose iterator types + indexing maps consistent
+/// with an outer-product microkernel:
+///   iters: [parallel, parallel, parallel, reduction]
+///   LHS map:   (d0,d1,d2,d3) -> (d0, d3, d2)    // input  tile
+///   RHS map:   (d0,d1,d2,d3) -> (d3, d1)        // filter tile
+///   OUT map:   (d0,d1,d2,d3) -> (d0, d1, d2)    // output tile
+///
+/// The body becomes: C += A * B, with types preserved (int/float).
+///
+/// Preconditions:
+///   - `tiledOps.front()` is the ukernel linalg.generic of the current tile.
+///   - `loopOps[idx], loopOps[idx+1]` are valid scf.for for outer/inner levels.
+///   - Exactly one tensor::CollapseShapeOp result per loop body identifies the
+///     packed value (outer = IS input / WS filter; inner = complement).
+///
+/// Paper reference: Section 5.5 (packing) and microkernel structure in Fig. 2.
+///
+/// Postconditions:
+///   - The original ukernel op is replaced by a new linalg.generic that reads
+///     from packed tensors and yields the same result type.
+///   - Any users within the loop bodies are updated; dead ops are erased.
 static LogicalResult
 adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                 SmallVector<Operation *> &tiledOps, SmallVector<Operation *> loopOps) {
@@ -607,8 +731,21 @@ adjustLinalgOps(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
   return success();
 }
 
-/// Apply the filter packing. This packing will be inserted at the begining of first or
-/// second loop level of the internal convolution depends of Input or Wheight Stationary
+/// @brief Create the filter packing tensor and collapse it to 2D.
+///
+/// Packed layout (no replication):  [Ic, Fh, Fw, Nf]  → collapse → [Ic*Fh*Fw, Nf]
+/// Iterates with a rank-4 linalg.generic that extracts from the original filter
+/// (Nf, Ic, Fh, Fw) and yields to the packed tensor in-order.
+///
+/// Schedule placement:
+///   - IS: insert at linalg.generic (so input remains stationary outside).
+///   - WS: insert at the outer loop to align with weight-stationary policy.
+///
+/// Paper reference: Section 4.1 (Filter Packing), Eqs. (1–2).
+///
+/// results:
+///   The packing is placed at the entry of the innermost loops (first or second)
+///   created by the second-level tiling, depending on the IS or WS schedule.
 static LogicalResult
 applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                   SmallVector<Operation *> &tiledOps, SmallVector<Operation *> loopOps) {
@@ -697,7 +834,8 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
   packingTensor->setAttrs({{"packing", rewriter.getStringAttr("filter")},
                            {"multipacking", rewriter.getBoolAttr(false)}});
 
-  // Apply tensor.collapse_shape on the dimensions of new packingTensor
+  // Collapsing [Ic, Fh, Fw, Nf] → [Ic*Fh*Fw, Nf] matches the “register-friendly”
+  // 2D panel expected by the outer-product microkernel (Fig. 2 of the paper).
   SmallVector<ReassociationIndices> collapseDims = {{0, 1, 2}, {3}};
   Value collapsedTensor = rewriter.create<tensor::CollapseShapeOp>(
       loc,
@@ -709,8 +847,27 @@ applyFilterPacking(RewriterBase &rewriter, Operation *transformOp, CSAStrategy r
   return success();
 }
 
-/// Apply the input packing. This packing will be inserted at the begining of first or
-/// second loop level of the internal convolution depends of Input or Wheight Stationary
+/// @brief Create the input packing tensor and collapse it to 3D.
+///
+/// Packed layout (with replication across windows):
+///   [N, Ic, Fh, Fw, Nwin] → collapse → [N, Ic*Fh*Fw, Nwin]
+/// Indexing follows Section 4 (Eqs. 11–12 and 8) and handles edge epilogue via
+/// `ss = getValidSplitSize(...)`. The implementation computes iHw using
+/// computeLinearInputIndices(), which folds stride/dilation and row wrapping.
+///
+/// Schedule placement:
+///   - IS: insert packing close to the inner loop (input-stationary).
+///   - WS: insert at ukernel op (weight-stationary).
+///
+/// Preconditions:
+///   - `loopOps[loopIndex]` is the inner loop; `loopOps[outerIndex]` the outer.
+///   - `Ow, Iw` are the *original* widths.
+///
+/// Paper reference: Section 4.2 (Input Packing), Eqs. (4–5, 8, 11–12, 15).
+///
+/// Results:
+///   Apply the input packing at the start of the innermost loops (first or second) 
+///   created by the second-level tiling, depending on the IS or WS schedule.
 static LogicalResult
 applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv,
     CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
@@ -821,7 +978,11 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
   packingTensor->setAttrs({{"packing", rewriter.getStringAttr("input")},
                            {"multipacking", rewriter.getBoolAttr(false)}});
 
-  // Apply tensor.collapse_shape on the dimensions of new packingTensor
+  // Collapse [N, Ic, Fh, Fw, Nwin] → [N, Ic*Fh*Fw, Nwin] to form a 3D packed
+  // tensor matching the microkernel’s expected input panel layout.
+  // This layout linearizes the receptive field (Ic×Fh×Fw) for each window,
+  // enabling contiguous memory access during the innermost computation.
+  // See Section 4.2 (Input Packing), Eqs. (11–12) in the paper.
   SmallVector<ReassociationIndices> collapseDims = {{0}, {1, 2, 3}, {4}};
   Value collapsedTensor = rewriter.create<tensor::CollapseShapeOp>(
       loc,
@@ -834,8 +995,21 @@ applyInputPacking(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaCo
   return success();
 }
 
-/// Swap the inner loops when schedule is Input Stationary. This is a workaround.
-/// Apparently, scf::tileUsingSCF innerInterchange has no effect!
+/// @brief Workaround for missing inner loop interchange effects in SCF tiler.
+///
+/// In IS schedule, the intended inner loop order may not be obtained using
+/// `tileUsingSCF` with `innerInterchange`. This routine swaps the induction
+/// variables and loop bounds manually to achieve the desired order.
+///
+/// Preconditions:
+///   - Only applicable to IS. Early-return otherwise.
+///   - `loopOps[idx]` and `loopOps[idx+1]` are valid scf.for.
+///
+/// Caveats:
+///   - This is a structural rewrite; verify future SCF tiler changes before
+///     removing it. Keep tests that pin the intended loop order.
+///
+/// Paper reference: aligns with Fig. 2 scheduling layers for IS.
 static LogicalResult
 swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy res,
                   SmallVector<Operation *> &tiledOps, SmallVector<Operation *> &loopOps) {
@@ -897,8 +1071,22 @@ swapInductionVars(RewriterBase &rewriter, Operation *transformOp, CSAStrategy re
   return success();
 }
 
-/// Pack multiple input tiles, adding another dimension to the packed tensor,
-/// and skip K * Nwin elements per iteration on WS schedule.
+/// @brief WS-only optimization: pack multiple input tiles (K2) at a higher level.
+///
+/// Adds a dimension Ti (num tiles) so the packed input becomes:
+///   [Ni, Ti, Nc, Fh, Fw, Nwin]
+/// and we index the source using (t*Nwin + nwin) (Eq. 14).
+///
+/// Placement:
+///   - Hoisted to the nest/outer loop so data reuse matches the L2 policy.
+///   - An affine.apply is inserted at the beginning of the inner loop to index
+///     the per-iteration slice (floorDiv by Nwin).
+///
+/// Paper reference: Section 4.2.1 (Multipacking).
+///
+/// Preconditions:
+///   - `res.schd == WS`.
+///   - `nestLoop`, `outerLoop`, `innerLoop` exist and are scf.for.
 static LogicalResult
 inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo csaConv, CSA csa,
     CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
@@ -1137,8 +1325,33 @@ inputMultipackingOpt(RewriterBase &rewriter, Operation *transformOp, ConvInfo cs
   return success();
 }
 
-/// Pack multiple filter tiles adding a new dimension to the tensor k2 which
-/// iterates over groups of Nf filters on IS.
+/// @brief IS-only optimization: pack multiple filter tiles at a higher level.
+///
+/// Adds a tile dimension Tf (number of filter tiles) so the packed filter becomes:
+///   [Tf, Ic, Fh, Fw, Nf] → collapse → [Tf, Ic*Fh*Fw, Nf]
+/// The source indexing uses (t*Nf + nf) within the inner loop, so that every
+/// Nf iterations we advance to the next filter tile in the multipacked buffer.
+///
+/// Placement:
+///   - Emitted at the outer loop of the second-level tiling to match the
+///     input-stationary policy (filters vary across tiles).
+///
+/// Paper reference:
+///   - Section 4.1 (Filter Packing)
+///   - Section 4.2.1 (Multipacking, filter case)
+///
+/// Preconditions:
+///   - `res.schd == IS`.
+///   - `nestLoop`, `outerLoop`, and `innerLoop` are valid scf.for.
+///   - Filter operand is normalized to (Nf, Ic, Fh, Fw).
+///
+/// Postconditions:
+///   - Produces a multipacked panel per Tf; the inner loop consumes slices
+///     selected via an affine index driven by the inner induction variable.
+///
+/// Notes:
+///   - Keep the packed 2D view [Ic*Fh*Fw, Nf] to match the outer-product
+///     microkernel’s RHS panel expectation (consistent with adjustLinalgOps()).
 static LogicalResult
 filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
                       CSAStrategy res, SmallVector<Operation *> &tiledOps,
@@ -1209,10 +1422,9 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
     AffineExpr d0, d1;
     bindDims(context, d0, d1);
     
-    // Create the affine map with both indices as inputs.
+    // Index Tf via (iv_inner / Nf) so that each group of Nf inner iterations
+    // switches to the next filter tile (analogous to the input multipacking scheme).
     AffineMap tfMap = AffineMap::get(2, 0, {d0 * Nf + d1}, context);
-    
-    // Construct the affineApply with the provided indices.
     Value TfIndex = rewriter.create<affine::AffineApplyOp>(loc, tfMap, ValueRange{index0, index4});
 
     // Create the extraction indices for the original filter tensor
@@ -1341,8 +1553,37 @@ filterMultipackingOpt(RewriterBase &rewriter, Operation *transformOp,
   return success();
 }
 
-/// Apply a tiling transformation to a modified payload ops and stores
-/// both the tiled operation (uKernel) as well as the created loops.
+/// @brief Apply two-level tiling to the target convolution operation.
+///
+/// Performs hierarchical tiling of the convolution according to the CSA
+/// (Convolution Slicing Analysis) parameters, producing a loop nest with
+/// outer and inner tiles sized by (Nc, K2, K3, Nwin).
+///
+/// Behavior:
+///   - The first-level tiling partitions the convolution into macro-tiles
+///     that fit L2 cache (driven by Nc and K2).
+///   - The second-level tiling refines each macro-tile into micro-tiles
+///     aligned with the register-level microkernel (Nwin × Nf).
+///   - The resulting loops form the structure over which packing and
+///     multipacking are later applied.
+///
+/// Paper reference:
+///   - Section 5.4 (Two-level Tiling)
+///   - Figure 2 (Loop hierarchy and scheduling order)
+///
+/// Preconditions:
+///   - The input op is a normalized linalg::GenericOp produced from a
+///     linalg::Conv2DNchwFchwOp by SConv normalization.
+///   - CSA analysis (`res`) provides valid tile sizes and schedule (IS/WS).
+///
+/// Postconditions:
+///   - Emits a pair of nested scf.for loops per tiling level.
+///   - Returns the tiled op and its loop handles for further packing steps.
+///
+/// Notes:
+///   - The loop interchange order may differ between IS and WS; in the
+///     Input-Stationary case, swapInductionVars() is invoked to ensure
+///     the expected inner loop order when innerInterchange is ineffective.
 static LogicalResult
 applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, ConvInfo csaConv,
     CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
@@ -1487,7 +1728,11 @@ applyTileTo(RewriterBase &rewriter, Operation *transformOp, Operation *target, C
   return success();
 }
 
-/// Validates the inputs for linalg::splitOp.
+//===----------------------------------------------------------------------===//
+// Helpers for splitAndTileConvolution
+//===----------------------------------------------------------------------===//
+
+/// @brief Validate convolution dimensions and CSA parameters before performing any split.
 /// Ensures that the dimension is valid and that the splitPoint, offsets, and sizes
 /// are well-formed (i.e., static and within bounds).
 LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp,
@@ -1548,7 +1793,8 @@ LogicalResult validateSplitInputs(RewriterBase &rewriter, Operation *transformOp
   return success();
 }
 
-/// Splits a linalg.generic op along a given dimension and splitPoint.
+/// @brief Execute the actual tensor split along the chosen dimension,
+/// producing main and edge parts.
 /// This assumes the dimension is splittable (CSA already validated bounds).
 std::pair<TilingInterface, TilingInterface>
 performSplit(RewriterBase &rewriter, TilingInterface op,
@@ -1583,7 +1829,8 @@ performSplit(RewriterBase &rewriter, TilingInterface op,
   return linalg::splitOp(rewriter, op, dimension, splitPoint);
 }
 
-/// Auxiliary function to perform split
+/// @brief Split the convolution op into multiple regions (main + edge) based on
+/// input and filter boundaries.
 static LogicalResult splitConvolution(
     RewriterBase &rewriter, Operation *transformOp, Operation *target, int64_t splitDim,
     int64_t splitSize, Operation *&firstOp, Operation *&secondOp) {
@@ -1618,7 +1865,8 @@ static LogicalResult splitConvolution(
   return success();
 }
 
-/// Helper for splitConvolution
+/// @brief Helper that creates and returns new linalg::GenericOp instances for
+/// each split convolution region.
 static LogicalResult
 splitConvHelper(RewriterBase &rewriter, Operation *transformOp,
     Operation *target, int64_t splitDim, int64_t splitSize,
@@ -1626,7 +1874,8 @@ splitConvHelper(RewriterBase &rewriter, Operation *transformOp,
   return splitConvolution(rewriter, transformOp, target, splitDim, splitSize, firstOp, secondOp);
 }
 
-/// Helper to apply a split and tile the first result using a modified strategy.
+/// @brief Apply a computed split to the current convolution and advance
+/// to process the next fragment.
 static LogicalResult
 applySplitAndAdvance(RewriterBase &rewriter, Operation *transformOp,
     Operation *&currentOp, int64_t dim, int64_t size, CSAStrategy res,
@@ -1658,8 +1907,36 @@ applySplitAndAdvance(RewriterBase &rewriter, Operation *transformOp,
   return success();
 };
 
-/// This function will be called when the convolution needs to be Splitted.
-/// It takes the original convolution (`genericOp`), performs the split, and then applies tiling.
+/// @brief Split edge-case regions (input/filter/CSA remainders) and apply two-level tiling.
+///
+/// Performs the edge handling and tiling pipeline over a convolution payload:
+///   1) Detects and splits edge tiles due to input/filter shapes or CSA
+///      remainder analysis (e.g., incomplete H×W windows or partial Nf).
+///   2) For each resulting convolution (main + edge pieces), either:
+///        - fast-path: if a split yields tiles smaller than the ukernel
+///          thresholds (Nwin for windows, Nf for filters), keep it as-is
+///          (only adjust indexing maps); or
+///        - full-path: run two-level tiling (outer/inner) and proceed with
+///          packing/multipacking according to the schedule (IS/WS).
+///
+/// Paper reference:
+///   - Section 5.3 (Edge-case splitting)
+///   - Section 5.4 (Two-level tiling) and Section 5.5 (Packing)
+///
+/// Preconditions:
+///   - The input op is a normalized linalg::GenericOp produced from a named
+///     2D conv (NCHW/FCHW).
+///   - CSA result provides schedule (IS/WS) and tile parameters (Nc, K2, K3, Nwin).
+///
+/// Postconditions:
+///   - Emits zero or more additional conv fragments for edges; each fragment is
+///     either left in adjusted form (small remainder) or tiled for the full path.
+///   - Returns handles to the tiled ops/loops for subsequent packing steps.
+///
+/// Notes:
+///   - Small remainders (< Nwin or < Nf) are currently handled without padding
+///     (maps adjusted only). A future pass may pad these fragments so they can
+///     follow the same tiling+packing pipeline.
 static LogicalResult
 splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operation* target, ConvInfo csaConv,
     CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
@@ -1725,9 +2002,14 @@ splitAndTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operatio
   return success();
 }
 
-/// In the input edge case of the microkernel, the generic's equations assume it starts at the beginning of the row.
-/// However, when the row is too small, as in this case, there is a row break in the generic of the last split.
-/// The function below adds the splitSize (macro offset) to the equation.
+/// @brief Adjust the indexing map of the second linalg.generic for input edge tiles.
+///
+/// In edge cases where the microkernel operates on a partial row (i.e., the last
+/// split of the input is smaller than Nwin), the default affine equations assume
+/// that computation starts at the beginning of a full row. This causes a row
+/// wrap in the final split. The adjustment below adds the split offset
+/// (splitSize) to the affine map, ensuring that indexing correctly continues
+/// from the proper macro offset within the input tensor.
 static FailureOr<linalg::GenericOp> 
 adjustSecondOpIndexingMap(RewriterBase &rewriter, Operation *secondOp, ConvInfo csaConv,
     SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations, int64_t splitSize) {
@@ -1779,7 +2061,14 @@ adjustSecondOpIndexingMap(RewriterBase &rewriter, Operation *secondOp, ConvInfo 
   return genericOp;
 }
 
-/// Auxiliary function to handle CSA edge case and/or apply tiling
+/// @brief Decide whether to perform two-level tiling or edge-case splitting for the given convolution.
+///
+/// Based on CSA results and current convolution shape, this function determines
+/// if the operation should go through the standard two-level tiling pipeline or
+/// first be split due to edge conditions (input/filter/CSA remainders).
+///
+/// Used internally by multiple stages of the SConv pipeline to unify the decision
+/// logic between treatEdgeTileConvolution() and splitAndTileConvolution().
 static LogicalResult handleTilingOrSplit(RewriterBase &rewriter, Operation *transformOp, Operation* op,
     ConvInfo csaConv, CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
     SmallVector<SmallVector<Operation*, 6>> &resultLoops, SmallVector<Operation*> &resultConvs) {
@@ -1805,8 +2094,18 @@ static LogicalResult handleTilingOrSplit(RewriterBase &rewriter, Operation *tran
   return success();
 }
 
-/// This function will be called when the convolution has edge cases in the Kernel
-/// It takes the convolution (`genericOp`), performs the necessary splits, and then applies tiling.
+/// @brief Detect and handle edge-case convolutions before applying CSA-based tiling.
+///
+/// Checks for edge tiles caused by input or filter dimensions that are not
+/// multiples of the microkernel sizes (Nwin, Nf). When such cases are found,
+/// it splits the convolution into regular and remainder parts to ensure that
+/// all valid regions can still follow the standard tiling and packing pipeline.
+///
+/// Paper reference: Section 5.3 (Edge-case splitting)
+///
+/// Postconditions:
+///   - Produces one or more smaller convolutions covering edge regions.
+///   - Returns the updated set of ops to be processed by splitAndTileConvolution().
 static LogicalResult
 treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operation* target, ConvInfo csaConv,
     CSA csa, CSAStrategy res, SmallVector<int64_t, 2> strides, SmallVector<int64_t, 2> dilations,
@@ -1898,9 +2197,36 @@ treatEdgeTileConvolution(RewriterBase &rewriter, Operation *transformOp, Operati
   return success();
 }
 
+/// @brief Entry point of the SConv transformation pipeline.
 ///
-/// Implementation of SConv::apply transform dialect operation.
+/// Implements the full SConv workflow over a linalg convolution payload:
+///   1) Normalize named convolution ops (e.g., Conv2DNchwFchwOp) to
+///      linalg::GenericOp with collapsed H×W dimensions.
+///   2) Run the Convolution Slicing Analysis (CSA) to determine tiling
+///      parameters (Nc, K2, K3, Nwin) and schedule policy (IS or WS).
+///   3) Detect and process edge cases through treatEdgeTileConvolution(),
+///      which may trigger splitting via splitAndTileConvolution().
+///   4) Apply two-level tiling to the main and split convolutions, followed by
+///      input/filter packing and optional multipacking depending on CSA.
+///   5) Adjust affine maps and indexing of remainder tiles when necessary.
 ///
+/// Paper reference:
+///   - Sections 2–5 (overall algorithm and pipeline)
+///   - Fig. 1 and Fig. 2 (SConv stages and loop hierarchy)
+///
+/// Preconditions:
+///   - The payload operation must be a valid linalg 2D convolution
+///     (NCHW/FCHW) or its normalized linalg::Generic equivalent.
+///   - Dependent dialects (Linalg, Affine, SCF, Tensor) must be registered.
+///
+/// Postconditions:
+///   - Produces a fully transformed convolution hierarchy suitable for
+///     lowering to microkernel-level code or backend-specific schedules.
+///   - Returns success() if all passes complete, or failure() otherwise.
+///
+/// Notes:
+///   - This function orchestrates all major SConv phases and is the main
+///     entry point invoked by the Transform dialect interpreter.
 DiagnosedSilenceableFailure
 transform::SConvOp::apply(transform::TransformRewriter &rewriter,
                           transform::TransformResults &results,

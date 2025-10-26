@@ -336,7 +336,6 @@ static Value computeMultiPackInputIndices(
 //===----------------------------------------------------------------------===//
 
 /// @brief Build an affine.apply that computes the flattened H×W index for a window.
-tility function used in promoteOpsOfTile below
 static Value createLinearizedAffineApply(OpBuilder &rewriter, Location loc,
                                          MLIRContext *context,
                                          Value ILrange, Value ILstart,
